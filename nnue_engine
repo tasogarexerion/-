@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+NNUE USI Proxy (YaneuraOu系想定)
+- bestmove は最強維持 + 安全フィルタ（強さを歪めない）
+- 候補提示は Winability（人間が勝ち切れる可能性）で整形
+- 頓死回避：見えてる mate負 除外 + 採用手の短時間安全確認（着手後追加探索）
+- 低Winability時は Initiative 重視の「下駄を預ける」候補も提示対象
+- モード：
+    PLAY    : bestmove最強維持（安全のみ）、候補表示は最小
+    WATCH   : bestmove最強維持（安全のみ）、候補表示＋ラベル＋ストーリー
+    ANALYZE : 候補数増、Winability順提示
+"""
+
+import os
+import sys
+import subprocess
+import threading
+import queue
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+# =========================
+# CONFIG (環境変数で上書き可)
+# =========================
+ENGINE_PATH = os.environ.get("TASO_ENGINE", "./YaneuraOu")
+NNUE_PATH   = os.environ.get("TASO_NNUE", "nnue.bin")
+
+# エンジン起動引数（やねうら王系）
+ENGINE_CMD = [ENGINE_PATH, "-eval", NNUE_PATH]
+
+# エンジンオプション（必要に応じて調整）
+THREADS = int(os.environ.get("TASO_THREADS", "6"))
+HASH_MB = int(os.environ.get("TASO_HASH_MB", "4096"))
+
+# プロキシの既定値
+DEFAULT_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
+PREFIX_K = int(os.environ.get("TASO_PREFIX_K", "6"))
+
+# Winability v1.1 パラメータ
+GOOD_CP_MARGIN = int(os.environ.get("TASO_GOOD_CP_MARGIN", "150"))  # “良い手”判定（bestからの差）
+DROP_SOFT_LIMIT = int(os.environ.get("TASO_DROP_SOFT_LIMIT", "200"))  # 普段の許容落差
+DROP_DISTURB_LIMIT = int(os.environ.get("TASO_DROP_DISTURB_LIMIT", "450"))  # 低Winability時の許容（下駄）
+MATE_SHORT_MAX = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
+
+# mateの距離はエンジン差があるので「符号優先・距離は弱く」扱う
+MATE_RISK_FLOOR = float(os.environ.get("TASO_MATE_RISK_FLOOR", "0.75"))
+MATE_RISK_TAU   = float(os.environ.get("TASO_MATE_RISK_TAU", "10.0"))
+MATE_INIT_FLOOR = float(os.environ.get("TASO_MATE_INIT_FLOOR", "0.60"))
+MATE_INIT_TAU   = float(os.environ.get("TASO_MATE_INIT_TAU", "8.0"))
+
+# 安全確認（着手後）: 20〜80ms推奨
+SAFETY_MS = int(os.environ.get("TASO_SAFETY_MS", "40"))
+
+# 表示
+SHOW = os.environ.get("TASO_SHOW", "1") == "1"
+DEBUG = os.environ.get("TASO_DEBUG", "0") == "1"
+
+READ_TIMEOUT = float(os.environ.get("TASO_READ_TIMEOUT", "0.1"))
+LINE_LIMIT = int(os.environ.get("TASO_LINE_LIMIT", "200000"))
+
+# モード
+MODE_PLAY = "PLAY"
+MODE_WATCH = "WATCH"
+MODE_ANALYZE = "ANALYZE"
+DEFAULT_MODE = os.environ.get("TASO_MODE", MODE_WATCH).upper()
+if DEFAULT_MODE not in (MODE_PLAY, MODE_WATCH, MODE_ANALYZE):
+    DEFAULT_MODE = MODE_WATCH
+
+# =========================
+# IO
+# =========================
+def out(s: str) -> None:
+    sys.stdout.write(s + "\n")
+    sys.stdout.flush()
+
+def info(s: str) -> None:
+    if SHOW:
+        out("info string " + s)
+
+def dbg(s: str) -> None:
+    if DEBUG:
+        sys.stderr.write("[TASO] " + s + "\n")
+        sys.stderr.flush()
+
+# =========================
+# Engine Wrapper
+# =========================
+class Engine:
+    def __init__(self):
+        self.p = subprocess.Popen(
+            ENGINE_CMD,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1
+        )
+        self.q: queue.Queue[str] = queue.Queue()
+        self.alive = True
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        assert self.p.stdout is not None
+        for line in self.p.stdout:
+            self.q.put(line.rstrip("\n"))
+        self.alive = False
+
+    def send(self, s: str) -> None:
+        if self.p.stdin is None:
+            return
+        try:
+            self.p.stdin.write(s + "\n")
+            self.p.stdin.flush()
+        except Exception:
+            self.alive = False
+
+    def recv(self, timeout: float = READ_TIMEOUT) -> Optional[str]:
+        try:
+            return self.q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        try:
+            self.send("quit")
+        except Exception:
+            pass
+        try:
+            self.p.terminate()
+        except Exception:
+            pass
+
+# =========================
+# Parsing helpers
+# =========================
+def _try_int(x: str) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+def parse_mate_token(tok: Optional[str]) -> Optional[int]:
+    if tok is None:
+        return None
+    # "+7" "-19" "7" など
+    if tok.startswith("+"):
+        tok = tok[1:]
+    return _try_int(tok)
+
+def prefix_len(a: str, b: str, k: int = PREFIX_K) -> int:
+    aa = a.split()
+    bb = b.split()
+    n = 0
+    for i in range(min(k, len(aa), len(bb))):
+        if aa[i] != bb[i]:
+            break
+        n += 1
+    return n
+
+@dataclass
+class Cand:
+    mpv: int
+    move: str
+    pv: str
+    cp: int
+    mate: Optional[int]
+
+@dataclass
+class Features:
+    stability: float
+    opp_diff: float
+    self_risk: float
+    initiative: float
+    winability: float
+    label: str
+
+def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, x))
+
+# =========================
+# Winability v1.1
+# =========================
+def mate_risk(d: int) -> float:
+    # 負のmateが“見えている”だけで危険（床）＋距離で少しだけ強める
+    # risk = floor + (1-floor)*exp(-d/tau)
+    import math
+    return clamp(MATE_RISK_FLOOR + (1.0 - MATE_RISK_FLOOR) * math.exp(-float(d) / MATE_RISK_TAU))
+
+def mate_initiative(d: int) -> float:
+    import math
+    return clamp(MATE_INIT_FLOOR + (1.0 - MATE_INIT_FLOOR) * math.exp(-float(d) / MATE_INIT_TAU))
+
+def compute_features(
+    cand: Cand,
+    best: Cand,
+    all_cands: List[Cand],
+    mode_hint: str
+) -> Features:
+    best_cp = best.cp
+    delta = best_cp - cand.cp
+    pv_pref = prefix_len(best.pv, cand.pv, PREFIX_K)
+    stability = clamp(pv_pref / float(max(1, PREFIX_K)))
+
+    # “良い手”の数（局面内相対）
+    good = 0
+    for c in all_cands:
+        if c.cp >= best_cp - GOOD_CP_MARGIN:
+            good += 1
+    good = max(1, good)
+    opp_diff = clamp(1.0 / float(good))
+
+    # 自己危険度（候補自体の危険 + 局面の荒さ）
+    # cand.mate<0 は通常候補に残さないが、念のため
+    risk = 0.2
+    if cand.mate is not None and cand.mate < 0:
+        risk = 1.0
+    else:
+        # “崖”っぽさ：delta が大きいほどリスク増（ただし少しだけ）
+        if delta >= 300:
+            risk = max(risk, 0.7)
+        elif delta >= 180:
+            risk = max(risk, 0.5)
+
+    # 局面全体で負のmateが見えているなら、危険度の床を上げる（ただし過剰反応は避ける）
+    mate_neg_best = None
+    for c in all_cands:
+        if c.mate is not None and c.mate < 0:
+            d = abs(c.mate)
+            if mate_neg_best is None or d < mate_neg_best:
+                mate_neg_best = d
+    if mate_neg_best is not None:
+        risk = max(risk, mate_risk(mate_neg_best))
+
+    self_risk = clamp(risk)
+
+    # Initiative（主導権）
+    initiative = 0.0
+
+    # 1) mate+ があれば強制性が高い
+    if cand.mate is not None and cand.mate > 0:
+        initiative = max(initiative, mate_initiative(abs(cand.mate)))
+
+    # 2) “相手の良い手が少ない”ほど主導権が効く（= 受け一択を迫りやすい）
+    # good=1なら強く、good>=5なら弱い
+    initiative = max(initiative, clamp(1.0 - min(1.0, good / 5.0)))
+
+    # 3) 低Winability域では、早い分岐（divergence）が「嫌味」になりやすい
+    divergence = clamp((PREFIX_K - pv_pref) / float(max(1, PREFIX_K)))
+    if mode_hint in ("DISTURB", "DESPERATE"):
+        initiative = clamp(initiative + 0.25 * divergence)
+
+    # Winability合成（v1.1）
+    # Momentumは v1.1 では明示項にせず（今は軽量）
+    win = (
+        0.30 * stability +
+        0.25 * opp_diff +
+        0.20 * (1.0 - self_risk) +
+        0.25 * initiative
+    )
+    winability = clamp(win)
+
+    # ラベル（人間が読む用）
+    # “攻め/受け/バランス”に加えて、勝ちやすさの階層を簡易表示
+    if winability >= 0.75:
+        tier = "安定勝ち"
+    elif winability >= 0.55:
+        tier = "勝負"
+    elif winability >= 0.35:
+        tier = "嫌味勝負"
+    else:
+        tier = "逆転狙い"
+
+    # 性質：initiative と stability の関係で
+    if initiative >= 0.70 and self_risk <= 0.60:
+        style = "攻め"
+    elif stability >= 0.60 and self_risk <= 0.60:
+        style = "安定"
+    elif initiative >= 0.60 and self_risk >= 0.70:
+        style = "開き直り"
+    else:
+        style = "バランス"
+
+    label = f"{tier}/{style}"
+    return Features(stability, opp_diff, self_risk, initiative, winability, label)
+
+# =========================
+# Candidate selection rules
+# =========================
+def decide_mode_from_best(best_feat: Features) -> str:
+    w = best_feat.winability
+    if w >= 0.75:
+        return "STABLE"
+    if w >= 0.55:
+        return "BALANCE"
+    if w >= 0.35:
+        return "DISTURB"
+    return "DESPERATE"
+
+def rank_candidates(
+    cands: List[Cand],
+    feats: Dict[str, Features],
+    best: Cand,
+    phase_mode: str
+) -> List[Cand]:
+    # phase_mode: STABLE/BALANCE/DISTURB/DESPERATE
+    best_cp = best.cp
+
+    def key(c: Cand) -> Tuple[float, float, float]:
+        f = feats[c.move]
+        delta = float(best_cp - c.cp)
+        pref = float(prefix_len(best.pv, c.pv, PREFIX_K))
+
+        if phase_mode == "STABLE":
+            # 事故らず勝つ：winability高 + delta小 + prefix長
+            return (f.winability, -delta, pref)
+        if phase_mode == "BALANCE":
+            return (f.winability, -pref, -delta)
+        if phase_mode == "DISTURB":
+            # 嫌味：initiative/opp_diffを重視しつつ winability も見る
+            return (0.5 * f.initiative + 0.3 * f.opp_diff + 0.2 * f.winability, -pref, -delta)
+        # DESPERATE: 逆転狙い（initiative最優先、多少のriskは許容）
+        return (0.7 * f.initiative + 0.2 * f.opp_diff + 0.1 * f.winability, -pref, -delta)
+
+    # ただし、候補集合から “あまりに酷い” は落とす（ただしDISTURB/DESPERATEは許容を広げる）
+    hard_limit = DROP_SOFT_LIMIT if phase_mode in ("STABLE", "BALANCE") else DROP_DISTURB_LIMIT
+    kept: List[Cand] = []
+    for c in cands:
+        delta = best_cp - c.cp
+        if delta <= hard_limit:
+            kept.append(c)
+
+    # どうしても残らない場合は元に戻す（探索空間を狭めない）
+    if not kept:
+        kept = list(cands)
+
+    kept.sort(key=key, reverse=True)
+    return kept
+
+# =========================
+# Safety check (post-move)
+# =========================
+def safety_check_after_move(
+    eng: Engine,
+    base_position: str,
+    move: str
+) -> bool:
+    """
+    採用手moveを指した後の局面で、短時間探索して mate - を検出したら unsafe(True)。
+    ※出力はGUIに流さない。
+    """
+    if not base_position.startswith("position"):
+        return False
+
+    # 新局面作成：position ... moves ... + move
+    toks = base_position.split()
+    if "moves" in toks:
+        newpos = base_position + " " + move
+    else:
+        newpos = base_position + " moves " + move
+
+    eng.send(newpos)
+    eng.send(f"go movetime {SAFETY_MS}")
+
+    unsafe = False
+    for _ in range(5000):
+        o = eng.recv(READ_TIMEOUT)
+        if o is None:
+            continue
+        if o.startswith("info") and " mate " in o:
+            tt = o.split()
+            if "mate" in tt:
+                m = parse_mate_token(tt[tt.index("mate") + 1] if tt.index("mate") + 1 < len(tt) else None)
+                if m is not None and m < 0:
+                    unsafe = True
+        if o.startswith("bestmove"):
+            break
+    return unsafe
+
+# =========================
+# Main USI loop
+# =========================
+def main() -> None:
+    eng = Engine()
+
+    current_position = ""
+    user_mode = DEFAULT_MODE
+    multipv = DEFAULT_MULTIPV
+
+    def apply_engine_opts():
+        eng.send(f"setoption name Threads value {THREADS}")
+        # Hash はエンジン側名称差があるので複数投げる（害は少ない）
+        eng.send(f"setoption name Hash value {HASH_MB}")
+        eng.send(f"setoption name USI_Hash value {HASH_MB}")
+        eng.send(f"setoption name HashSize value {HASH_MB}")
+        eng.send(f"setoption name MultiPV value {multipv}")
+
+    try:
+        while True:
+            raw = sys.stdin.readline()
+            if not raw:
+                break
+            line = raw.strip()
+            if not line:
+                continue
+
+            if line == "usi":
+                eng.send("usi")
+                # 先にエンジンのoptionを流す
+                while True:
+                    o = eng.recv(READ_TIMEOUT)
+                    if o is None:
+                        continue
+                    if o == "usiok":
+                        # ここでプロキシ独自optionを注入（USI準拠）
+                        out('option name TASO_Mode type combo default {} var PLAY var WATCH var ANALYZE'.format(DEFAULT_MODE))
+                        out('option name TASO_MultiPV type spin default {} min 1 max 10'.format(DEFAULT_MULTIPV))
+                        out('option name TASO_SafetyMs type spin default {} min 0 max 500'.format(SAFETY_MS))
+                        out("usiok")
+                        break
+                    out(o)
+                apply_engine_opts()
+                continue
+
+            if line.startswith("setoption"):
+                # プロキシ独自optionを解釈
+                # 形式: setoption name XXX value YYY
+                toks = line.split()
+                if "name" in toks:
+                    i = toks.index("name")
+                    name = toks[i + 1] if i + 1 < len(toks) else ""
+                    value = ""
+                    if "value" in toks:
+                        j = toks.index("value")
+                        value = " ".join(toks[j + 1 :]) if j + 1 < len(toks) else ""
+
+                    if name == "TASO_Mode":
+                        v = value.strip().upper()
+                        if v in (MODE_PLAY, MODE_WATCH, MODE_ANALYZE):
+                            user_mode = v
+                            info(f"mode set => {user_mode}")
+                        continue
+
+                    if name == "TASO_MultiPV":
+                        mv = _try_int(value.strip())
+                        if mv is not None and 1 <= mv <= 10:
+                            multipv = mv
+                            info(f"multipv set => {multipv}")
+                            apply_engine_opts()
+                        continue
+
+                    if name == "TASO_SafetyMs":
+                        # 安全確認時間は環境変数優先のため、ここでは表示のみ（設計上）
+                        # 実際に変えるなら env TASO_SAFETY_MS を使う想定
+                        info("TASO_SafetyMs is fixed via env TASO_SAFETY_MS (restart required)")
+                        continue
+
+                # それ以外は素通し
+                eng.send(line)
+                continue
+
+            if line == "isready":
+                eng.send("isready")
+                # readyokまで（infoが混ざっても最後にreadyok返す）
+                while True:
+                    o = eng.recv(READ_TIMEOUT)
+                    if o is None:
+                        continue
+                    if o == "readyok":
+                        out("readyok")
+                        break
+                    # エンジンのinfoは流して良い
+                    if o.startswith("info"):
+                        out(o)
+                continue
+
+            if line.startswith("position"):
+                current_position = line
+                eng.send(line)
+                continue
+
+            if line.startswith("go"):
+                # 探索開始
+                apply_engine_opts()
+                eng.send(line)
+
+                # info収集
+                infos: List[str] = []
+                cands_map: Dict[int, Cand] = {}
+                best_engine_move: Optional[str] = None
+
+                for _ in range(LINE_LIMIT):
+                    o = eng.recv(READ_TIMEOUT)
+                    if o is None:
+                        continue
+
+                    if o.startswith("info"):
+                        infos.append(o)
+                        out(o)
+
+                        # PVを拾う
+                        tt = o.split()
+                        mpv = 1
+                        if "multipv" in tt:
+                            m = _try_int(tt[tt.index("multipv") + 1] if tt.index("multipv") + 1 < len(tt) else "")
+                            if m is not None:
+                                mpv = m
+
+                        cp = None
+                        if "score" in tt and "cp" in tt:
+                            cp = _try_int(tt[tt.index("cp") + 1] if tt.index("cp") + 1 < len(tt) else "")
+
+                        mate = None
+                        if "mate" in tt:
+                            mate = parse_mate_token(tt[tt.index("mate") + 1] if tt.index("mate") + 1 < len(tt) else None)
+
+                        if "pv" in tt:
+                            i_pv = tt.index("pv")
+                            if i_pv + 1 < len(tt):
+                                pv = " ".join(tt[i_pv + 1 :])
+                                mv = tt[i_pv + 1]
+                                # cpが無いと比較しにくいので、無い時は0扱いで一旦入れる（後で上書きされる）
+                                cands_map[mpv] = Cand(mpv=mpv, move=mv, pv=pv, cp=(cp if cp is not None else 0), mate=mate)
+                        continue
+
+                    if o.startswith("bestmove"):
+                        parts = o.split()
+                        best_engine_move = parts[1] if len(parts) >= 2 else None
+                        break
+
+                    out(o)
+
+                # 候補が取れない場合はエンジンbestをそのまま返す
+                if best_engine_move is None:
+                    out("bestmove resign")
+                    continue
+
+                cands = list(cands_map.values())
+                if not cands:
+                    out(f"bestmove {best_engine_move}")
+                    continue
+
+                # mpv1をbest扱い（なければcp最大）
+                if 1 in cands_map:
+                    best = cands_map[1]
+                else:
+                    best = max(cands, key=lambda c: c.cp)
+
+                # まず “見えてる自玉mate負” を候補から除外（頓死回避の第1段）
+                safe_cands = [c for c in cands if not (c.mate is not None and c.mate < 0)]
+                if not safe_cands:
+                    safe_cands = cands  # 全部危険なら捨てない（情報としては残す）
+
+                # short mate があれば表示で強調（bestmoveは歪めないが、人間に見せる）
+                short_mate = None
+                for c in safe_cands:
+                    if c.mate is not None and c.mate > 0:
+                        if short_mate is None or c.mate < short_mate[0]:
+                            short_mate = (c.mate, c.move)
+
+                # Winability（v1.1）を各候補に付与
+                feats_by_move: Dict[str, Features] = {}
+                # phase_mode は “best候補のwinability” から決める（局面状態）
+                tmp_best_feat = compute_features(best, best, safe_cands, "BALANCE")
+                phase_mode = decide_mode_from_best(tmp_best_feat)
+
+                for c in safe_cands:
+                    feats_by_move[c.move] = compute_features(c, best, safe_cands, phase_mode)
+
+                # 候補の並べ替え（表示用）
+                ranked = rank_candidates(safe_cands, feats_by_move, best, phase_mode)
+
+                # ===== bestmove（指す手）は強さ維持 =====
+                # 原則：エンジンbestを採用。ただし「見えてるmate負」なら安全手へ落とす。
+                chosen = best_engine_move
+
+                # エンジンbestが候補PVに存在し、しかも mate負なら除外
+                #（候補に無い場合は safety check で補う）
+                for c in cands:
+                    if c.move == chosen and (c.mate is not None and c.mate < 0):
+                        info("⚠ bestmove shows self-mate in PV -> fallback to safest")
+                        # cp最大のsafeへ
+                        chosen = max(safe_cands, key=lambda x: x.cp).move
+                        break
+
+                # 頓死回避 第2段：着手後安全確認（短時間）
+                if SAFETY_MS > 0 and current_position:
+                    unsafe = safety_check_after_move(eng, current_position, chosen)
+                    if unsafe:
+                        info(f"☠ safety-check failed for {chosen} -> fallback")
+                        # 代替：ranked上位から安全確認に通るものを探す（数本だけ）
+                        alt = None
+                        for c in ranked[: min(5, len(ranked))]:
+                            if c.move == chosen:
+                                continue
+                            if safety_check_after_move(eng, current_position, c.move):
+                                continue
+                            alt = c.move
+                            break
+                        if alt is not None:
+                            chosen = alt
+                        else:
+                            # 代替が取れない場合は仕方なくそのまま（ここで投了はしない）
+                            info("☠ no alternative passed safety-check (keep chosen)")
+
+                # ===== 表示（候補提示） =====
+                # PLAY: 最小、WATCH: ほどほど、ANALYZE: 多め
+                if user_mode == MODE_PLAY:
+                    # 事故回避情報だけ
+                    f_best = feats_by_move.get(best.move)
+                    if f_best:
+                        info(f"[TASO] phase={phase_mode} win(bestPV)={f_best.winability:.2f} {f_best.label}")
+                    if short_mate and short_mate[0] <= MATE_SHORT_MAX:
+                        info(f"⚡ short-mate seen: mate {short_mate[0]} (pv move {short_mate[1]})")
+
+                elif user_mode == MODE_WATCH:
+                    f_best = feats_by_move.get(best.move)
+                    if f_best:
+                        info(f"[TASO] phase={phase_mode} win(bestPV)={f_best.winability:.2f} {f_best.label}")
+                    if short_mate and short_mate[0] <= MATE_SHORT_MAX:
+                        info(f"⚡ short-mate seen: mate {short_mate[0]} (pv move {short_mate[1]})")
+
+                    show_n = min(3, len(ranked))
+                    for i in range(show_n):
+                        c = ranked[i]
+                        f = feats_by_move[c.move]
+                        delta = best.cp - c.cp
+                        info(f"候補{i+1}: {c.move}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f}  {f.label}")
+
+                else:  # ANALYZE
+                    f_best = feats_by_move.get(best.move)
+                    if f_best:
+                        info(f"[TASO] phase={phase_mode} win(bestPV)={f_best.winability:.2f} {f_best.label}")
+                    show_n = min(max(5, multipv), len(ranked))
+                    for i in range(show_n):
+                        c = ranked[i]
+                        f = feats_by_move[c.move]
+                        delta = best.cp - c.cp
+                        info(f"[{i+1}] {c.move}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f} "
+                             f"(stab={f.stability:.2f} diff={f.opp_diff:.2f} risk={f.self_risk:.2f} init={f.initiative:.2f}) "
+                             f"{f.label}")
+
+                # 最後に bestmove
+                out(f"bestmove {chosen}")
+                continue
+
+            if line == "quit":
+                break
+
+            # その他コマンドは素通し
+            eng.send(line)
+
+    finally:
+        eng.close()
+
+if __name__ == "__main__":
+    main()

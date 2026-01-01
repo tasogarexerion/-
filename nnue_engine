@@ -12,12 +12,14 @@ NNUE USI Proxy (YaneuraOu系想定)
     WATCH   : bestmove最強維持（安全のみ）、候補表示＋ラベル＋ストーリー
     ANALYZE : 候補数増、Winability順提示
 
-[Patch]
+[Patch (integrated)]
 - safety_check_after_move の mate 符号（手番）を修正（着手後は相手番→ mate+ は危険）
-- safety_check を回数上限ではなく時間デッドラインで終了（ハングしにくい）
+- safety_check を時間デッドラインで終了（ハングしにくい）
+- safety_check で bestmove 未回収なら stop を送り、bestmove を短時間回収して同期
 - safety_check 前後の queue を drain（誤読・残骸防止）
 - go のハードタイムアウト追加（bestmoveが返らない時に固まらない）
 - cp欠損時（mateのみ等）の暫定cpを改善（順位付けの破綻を防ぐ）
+- さらに：巨大cp(±30000)が相対計算を壊さないガード（mateはmateとして扱う）
 """
 
 import os
@@ -35,44 +37,41 @@ from typing import Dict, List, Optional, Tuple
 ENGINE_PATH = os.environ.get("TASO_ENGINE", "./YaneuraOu")
 NNUE_PATH   = os.environ.get("TASO_NNUE", "nnue.bin")
 
-# エンジン起動引数（やねうら王系）
 ENGINE_CMD = [ENGINE_PATH, "-eval", NNUE_PATH]
 
-# エンジンオプション（必要に応じて調整）
 THREADS = int(os.environ.get("TASO_THREADS", "6"))
 HASH_MB = int(os.environ.get("TASO_HASH_MB", "4096"))
 
-# プロキシの既定値
 DEFAULT_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
 PREFIX_K = int(os.environ.get("TASO_PREFIX_K", "6"))
 
-# Winability v1.1 パラメータ
-GOOD_CP_MARGIN = int(os.environ.get("TASO_GOOD_CP_MARGIN", "150"))  # “良い手”判定（bestからの差）
-DROP_SOFT_LIMIT = int(os.environ.get("TASO_DROP_SOFT_LIMIT", "200"))  # 普段の許容落差
-DROP_DISTURB_LIMIT = int(os.environ.get("TASO_DROP_DISTURB_LIMIT", "450"))  # 低Winability時の許容（下駄）
+GOOD_CP_MARGIN = int(os.environ.get("TASO_GOOD_CP_MARGIN", "150"))
+DROP_SOFT_LIMIT = int(os.environ.get("TASO_DROP_SOFT_LIMIT", "200"))
+DROP_DISTURB_LIMIT = int(os.environ.get("TASO_DROP_DISTURB_LIMIT", "450"))
 MATE_SHORT_MAX = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
 
-# mateの距離はエンジン差があるので「符号優先・距離は弱く」扱う
 MATE_RISK_FLOOR = float(os.environ.get("TASO_MATE_RISK_FLOOR", "0.75"))
 MATE_RISK_TAU   = float(os.environ.get("TASO_MATE_RISK_TAU", "10.0"))
 MATE_INIT_FLOOR = float(os.environ.get("TASO_MATE_INIT_FLOOR", "0.60"))
 MATE_INIT_TAU   = float(os.environ.get("TASO_MATE_INIT_TAU", "8.0"))
 
-# 安全確認（着手後）: 20〜80ms推奨
 SAFETY_MS = int(os.environ.get("TASO_SAFETY_MS", "40"))
 
-# 表示
 SHOW = os.environ.get("TASO_SHOW", "1") == "1"
 DEBUG = os.environ.get("TASO_DEBUG", "0") == "1"
 
 READ_TIMEOUT = float(os.environ.get("TASO_READ_TIMEOUT", "0.1"))
 LINE_LIMIT = int(os.environ.get("TASO_LINE_LIMIT", "200000"))
 
-# go のハードタイムアウト（bestmove返らない固まり対策）
 GO_HARD_SEC = float(os.environ.get("TASO_GO_HARD_SEC", "60.0"))
 GO_STOP_GRACE_SEC = float(os.environ.get("TASO_GO_STOP_GRACE_SEC", "3.0"))
 
-# モード
+# safety_check deadline（固定+0.6は重いので比例型）
+SAFETY_DEADLINE_MIN_SEC = float(os.environ.get("TASO_SAFETY_DEADLINE_MIN_SEC", "0.20"))
+SAFETY_DEADLINE_FACTOR  = float(os.environ.get("TASO_SAFETY_DEADLINE_FACTOR", "3.0"))
+SAFETY_DEADLINE_PAD_SEC = float(os.environ.get("TASO_SAFETY_DEADLINE_PAD_SEC", "0.05"))
+SAFETY_STOP_GRACE_SEC   = float(os.environ.get("TASO_SAFETY_STOP_GRACE_SEC", "0.25"))
+
 MODE_PLAY = "PLAY"
 MODE_WATCH = "WATCH"
 MODE_ANALYZE = "ANALYZE"
@@ -140,8 +139,8 @@ class Engine:
         except queue.Empty:
             return None
 
-    def drain(self, limit: int = 10000) -> None:
-        """queueの残骸を捨てる（安全確認前後の誤読防止）"""
+    def drain(self, limit: int = 200000) -> int:
+        """queueの残骸を捨てる（誤読・混線防止）"""
         n = 0
         while n < limit:
             try:
@@ -149,6 +148,7 @@ class Engine:
                 n += 1
             except queue.Empty:
                 break
+        return n
 
     def close(self) -> None:
         try:
@@ -172,7 +172,6 @@ def _try_int(x: str) -> Optional[int]:
 def parse_mate_token(tok: Optional[str]) -> Optional[int]:
     if tok is None:
         return None
-    # "+7" "-19" "7" など
     if tok.startswith("+"):
         tok = tok[1:]
     return _try_int(tok)
@@ -218,26 +217,34 @@ def mate_initiative(d: int) -> float:
     import math
     return clamp(MATE_INIT_FLOOR + (1.0 - MATE_INIT_FLOOR) * math.exp(-float(d) / MATE_INIT_TAU))
 
+def _safe_best_cp(best_cp: int) -> int:
+    # mateのみ等で±30000を入れても、相対計算の基準にすると壊れるのでガード
+    return 0 if abs(best_cp) >= 20000 else best_cp
+
 def compute_features(
     cand: Cand,
     best: Cand,
-    all_cands: List[Cand],
+    context_cands: List[Cand],   # ※フィルタ前を渡す（mate負の気配も拾う）
     mode_hint: str
 ) -> Features:
-    best_cp = best.cp
-    delta = best_cp - cand.cp
+    best_cp_used = _safe_best_cp(best.cp)
+    cand_cp_used = 0 if abs(cand.cp) >= 20000 else cand.cp
+
+    delta = best_cp_used - cand_cp_used
+
     pv_pref = prefix_len(best.pv, cand.pv, PREFIX_K)
     stability = clamp(pv_pref / float(max(1, PREFIX_K)))
 
-    # “良い手”の数（局面内相対）
+    # “良い手”の数（局面内相対）— mate巨大cpに引きずられないよう best_cp_used を使う
     good = 0
-    for c in all_cands:
-        if c.cp >= best_cp - GOOD_CP_MARGIN:
+    for c in context_cands:
+        ccp = 0 if abs(c.cp) >= 20000 else c.cp
+        if ccp >= best_cp_used - GOOD_CP_MARGIN:
             good += 1
     good = max(1, good)
     opp_diff = clamp(1.0 / float(good))
 
-    # 自己危険度（候補自体の危険 + 局面の荒さ）
+    # 自己危険度
     risk = 0.2
     if cand.mate is not None and cand.mate < 0:
         risk = 1.0
@@ -247,8 +254,9 @@ def compute_features(
         elif delta >= 180:
             risk = max(risk, 0.5)
 
+    # 局面全体での mate負気配（フィルタ前の context から拾う）
     mate_neg_best = None
-    for c in all_cands:
+    for c in context_cands:
         if c.mate is not None and c.mate < 0:
             d = abs(c.mate)
             if mate_neg_best is None or d < mate_neg_best:
@@ -258,7 +266,7 @@ def compute_features(
 
     self_risk = clamp(risk)
 
-    # Initiative（主導権）
+    # Initiative
     initiative = 0.0
     if cand.mate is not None and cand.mate > 0:
         initiative = max(initiative, mate_initiative(abs(cand.mate)))
@@ -317,11 +325,12 @@ def rank_candidates(
     best: Cand,
     phase_mode: str
 ) -> List[Cand]:
-    best_cp = best.cp
+    best_cp_used = _safe_best_cp(best.cp)
 
     def key(c: Cand) -> Tuple[float, float, float]:
         f = feats[c.move]
-        delta = float(best_cp - c.cp)
+        ccp = 0 if abs(c.cp) >= 20000 else c.cp
+        delta = float(best_cp_used - ccp)
         pref = float(prefix_len(best.pv, c.pv, PREFIX_K))
 
         if phase_mode == "STABLE":
@@ -333,9 +342,11 @@ def rank_candidates(
         return (0.7 * f.initiative + 0.2 * f.opp_diff + 0.1 * f.winability, -pref, -delta)
 
     hard_limit = DROP_SOFT_LIMIT if phase_mode in ("STABLE", "BALANCE") else DROP_DISTURB_LIMIT
+
     kept: List[Cand] = []
     for c in cands:
-        delta = best_cp - c.cp
+        ccp = 0 if abs(c.cp) >= 20000 else c.cp
+        delta = best_cp_used - ccp
         if delta <= hard_limit:
             kept.append(c)
 
@@ -354,9 +365,9 @@ def safety_check_after_move(
     move: str
 ) -> bool:
     """
-    採用手moveを指した後の局面で、短時間探索して「相手の詰み（= 自分が詰む）」を検出したら unsafe。
-    注意：moveを指した直後は相手番になるので、info mate +N は相手が詰ます＝危険。
-    ※出力はGUIに流さない。
+    moveを指した後の局面（相手番）で短時間探索。
+    相手番なので、info mate +N は「相手が詰ます」= 自玉が詰む → unsafe。
+    bestmove未回収でdeadlineを超えたら stop を送り、bestmoveを短時間回収して同期。
     """
     if not base_position.startswith("position"):
         return False
@@ -373,7 +384,10 @@ def safety_check_after_move(
     eng.send(f"go movetime {SAFETY_MS}")
 
     unsafe = False
-    deadline = time.time() + (max(1, SAFETY_MS) / 1000.0) + 0.6  # 少し余裕
+    t0 = time.time()
+    deadline = t0 + max(SAFETY_DEADLINE_MIN_SEC, (max(1, SAFETY_MS) / 1000.0) * SAFETY_DEADLINE_FACTOR) + SAFETY_DEADLINE_PAD_SEC
+
+    got_bestmove = False
 
     while time.time() < deadline:
         o = eng.recv(READ_TIMEOUT)
@@ -385,12 +399,23 @@ def safety_check_after_move(
             if "mate" in tt:
                 idx = tt.index("mate")
                 m = parse_mate_token(tt[idx + 1] if idx + 1 < len(tt) else None)
-                # ここが修正点：相手番なので mate+ は危険
                 if m is not None and m > 0:
                     unsafe = True
 
         if o.startswith("bestmove"):
+            got_bestmove = True
             break
+
+    if not got_bestmove:
+        # 探索が残って混線するのが一番危険なので stop → bestmove回収で同期
+        eng.send("stop")
+        t_stop = time.time() + SAFETY_STOP_GRACE_SEC
+        while time.time() < t_stop:
+            o = eng.recv(READ_TIMEOUT)
+            if o is None:
+                continue
+            if o.startswith("bestmove"):
+                break
 
     eng.drain()
     return unsafe
@@ -492,15 +517,18 @@ def main() -> None:
                 continue
 
             if line.startswith("go"):
+                # go開始前に残骸を捨てる（安全確認などの混線対策）
+                eng.drain()
+
                 apply_engine_opts()
                 eng.send(line)
 
-                infos: List[str] = []
                 cands_map: Dict[int, Cand] = {}
                 best_engine_move: Optional[str] = None
 
                 t_go = time.time()
                 sent_stop = False
+                already_resigned = False
 
                 for _ in range(LINE_LIMIT):
                     # ハードタイムアウト
@@ -508,11 +536,12 @@ def main() -> None:
                         if not sent_stop:
                             eng.send("stop")
                             sent_stop = True
+                            # stop後は少しだけbestmove待つ
                             t_go = time.time() - (GO_HARD_SEC - GO_STOP_GRACE_SEC)
                         else:
                             info("⚠ go timeout: bestmove not returned -> resign")
                             out("bestmove resign")
-                            best_engine_move = None
+                            already_resigned = True
                             break
 
                     o = eng.recv(READ_TIMEOUT)
@@ -520,7 +549,6 @@ def main() -> None:
                         continue
 
                     if o.startswith("info"):
-                        infos.append(o)
                         out(o)
 
                         tt = o.split()
@@ -544,7 +572,7 @@ def main() -> None:
                                 pv = " ".join(tt[i_pv + 1 :])
                                 mv = tt[i_pv + 1]
 
-                                # cp欠損時の暫定（mate優先）
+                                # cp欠損時の暫定（mate優先、ただし相対計算でガードする）
                                 if cp is None:
                                     if mate is not None:
                                         cp = 30000 if mate > 0 else -30000
@@ -561,10 +589,10 @@ def main() -> None:
 
                     out(o)
 
+                if already_resigned:
+                    continue
+
                 if best_engine_move is None:
-                    # timeoutで既にbestmoveを返してる場合は何もしない
-                    if sent_stop:
-                        continue
                     out("bestmove resign")
                     continue
 
@@ -573,38 +601,42 @@ def main() -> None:
                     out(f"bestmove {best_engine_move}")
                     continue
 
-                if 1 in cands_map:
-                    best = cands_map[1]
-                else:
-                    best = max(cands, key=lambda c: c.cp)
+                # bestはmpv1優先
+                best = cands_map[1] if 1 in cands_map else max(cands, key=lambda c: c.cp)
 
+                # 頓死回避 第1段：見えてる自玉mate負は候補から落とす（表示用候補）
                 safe_cands = [c for c in cands if not (c.mate is not None and c.mate < 0)]
                 if not safe_cands:
                     safe_cands = cands
 
+                # short mateの検出（表示用）
                 short_mate = None
                 for c in safe_cands:
                     if c.mate is not None and c.mate > 0:
                         if short_mate is None or c.mate < short_mate[0]:
                             short_mate = (c.mate, c.move)
 
-                feats_by_move: Dict[str, Features] = {}
-                tmp_best_feat = compute_features(best, best, safe_cands, "BALANCE")
+                # 特徴量は「フィルタ前のcands」をcontextとして使う（mate負気配を拾う）
+                tmp_best_feat = compute_features(best, best, cands, "BALANCE")
                 phase_mode = decide_mode_from_best(tmp_best_feat)
 
+                feats_by_move: Dict[str, Features] = {}
                 for c in safe_cands:
-                    feats_by_move[c.move] = compute_features(c, best, safe_cands, phase_mode)
+                    feats_by_move[c.move] = compute_features(c, best, cands, phase_mode)
 
                 ranked = rank_candidates(safe_cands, feats_by_move, best, phase_mode)
 
+                # ===== bestmove（指す手）は強さ維持 =====
                 chosen = best_engine_move
 
+                # エンジンbestがPV内で自玉mate負なら、最良のsafeへ
                 for c in cands:
                     if c.move == chosen and (c.mate is not None and c.mate < 0):
                         info("⚠ bestmove shows self-mate in PV -> fallback to safest")
                         chosen = max(safe_cands, key=lambda x: x.cp).move
                         break
 
+                # 頓死回避 第2段：着手後安全確認（短時間）
                 if SAFETY_MS > 0 and current_position:
                     unsafe = safety_check_after_move(eng, current_position, chosen)
                     if unsafe:
@@ -622,6 +654,7 @@ def main() -> None:
                         else:
                             info("☠ no alternative passed safety-check (keep chosen)")
 
+                # ===== 表示（候補提示） =====
                 if user_mode == MODE_PLAY:
                     f_best = feats_by_move.get(best.move)
                     if f_best:
@@ -640,8 +673,14 @@ def main() -> None:
                     for i in range(show_n):
                         c = ranked[i]
                         f = feats_by_move[c.move]
-                        delta = best.cp - c.cp
-                        info(f"候補{i+1}: {c.move}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f}  {f.label}")
+                        # 表示は生cp（ただし巨大cpは注釈）
+                        cp_disp = c.cp
+                        if abs(cp_disp) >= 20000:
+                            info(f"候補{i+1}: {c.move}  cp=mate-only  win={f.winability:.2f}  {f.label}")
+                        else:
+                            # best.cpが巨大でも表示崩れしないようΔは0基準にしない（読み物としてはOK）
+                            delta = (_safe_best_cp(best.cp) - (0 if abs(c.cp) >= 20000 else c.cp))
+                            info(f"候補{i+1}: {c.move}  cp={cp_disp:+d} Δ={delta:+d}  win={f.winability:.2f}  {f.label}")
 
                 else:  # ANALYZE
                     f_best = feats_by_move.get(best.move)
@@ -651,10 +690,15 @@ def main() -> None:
                     for i in range(show_n):
                         c = ranked[i]
                         f = feats_by_move[c.move]
-                        delta = best.cp - c.cp
-                        info(f"[{i+1}] {c.move}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f} "
-                             f"(stab={f.stability:.2f} diff={f.opp_diff:.2f} risk={f.self_risk:.2f} init={f.initiative:.2f}) "
-                             f"{f.label}")
+                        if abs(c.cp) >= 20000:
+                            info(f"[{i+1}] {c.move}  cp=mate-only  win={f.winability:.2f} "
+                                 f"(stab={f.stability:.2f} diff={f.opp_diff:.2f} risk={f.self_risk:.2f} init={f.initiative:.2f}) "
+                                 f"{f.label}")
+                        else:
+                            delta = (_safe_best_cp(best.cp) - (0 if abs(c.cp) >= 20000 else c.cp))
+                            info(f"[{i+1}] {c.move}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f} "
+                                 f"(stab={f.stability:.2f} diff={f.opp_diff:.2f} risk={f.self_risk:.2f} init={f.initiative:.2f}) "
+                                 f"{f.label}")
 
                 out(f"bestmove {chosen}")
                 continue

@@ -12,14 +12,10 @@ NNUE USI Proxy (YaneuraOu系想定)
     WATCH   : bestmove最強維持（安全のみ）、候補表示＋ラベル＋ストーリー
     ANALYZE : 候補数増、Winability順提示
 
-[Patch (integrated)]
-- safety_check_after_move の mate 符号（手番）を修正（着手後は相手番→ mate+ は危険）
-- safety_check を時間デッドラインで終了（ハングしにくい）
-- safety_check で bestmove 未回収なら stop を送り、bestmove を短時間回収して同期
-- safety_check 前後の queue を drain（誤読・残骸防止）
-- go のハードタイムアウト追加（bestmoveが返らない時に固まらない）
-- cp欠損時（mateのみ等）の暫定cpを改善（順位付けの破綻を防ぐ）
-- さらに：巨大cp(±30000)が相対計算を壊さないガード（mateはmateとして扱う）
+[Patch (executed)]
+- safety_check_after_move の終了時に base_position を再送して局面を「必ず」復元（状態汚染防止）
+- safety_check の mate+ を “短手数は即unsafe / 長手数は複数回観測でunsafe” にして誤検出を減らす
+- safety_check 中だけ recv timeout を短くして重さを減らす（READ_TIMEOUTは変更しない）
 """
 
 import os
@@ -71,6 +67,14 @@ SAFETY_DEADLINE_MIN_SEC = float(os.environ.get("TASO_SAFETY_DEADLINE_MIN_SEC", "
 SAFETY_DEADLINE_FACTOR  = float(os.environ.get("TASO_SAFETY_DEADLINE_FACTOR", "3.0"))
 SAFETY_DEADLINE_PAD_SEC = float(os.environ.get("TASO_SAFETY_DEADLINE_PAD_SEC", "0.05"))
 SAFETY_STOP_GRACE_SEC   = float(os.environ.get("TASO_SAFETY_STOP_GRACE_SEC", "0.25"))
+
+# --- Patch knobs (new; safe defaults) ---
+# safety_check中だけ短いtimeoutを使う（重さ軽減）
+SAFETY_READ_TIMEOUT = float(os.environ.get("TASO_SAFETY_READ_TIMEOUT", "0.02"))
+# mate+ を unsafe と断定する「短手数」閾値（短い詰みほど信頼できる）
+SAFETY_MATE_MAX = int(os.environ.get("TASO_SAFETY_MATE_MAX", str(MATE_SHORT_MAX)))
+# 長手数mate+ は複数回観測でunsafe（単発誤検出を弾く）
+SAFETY_MATE_REPEAT = int(os.environ.get("TASO_SAFETY_MATE_REPEAT", "2"))
 
 MODE_PLAY = "PLAY"
 MODE_WATCH = "WATCH"
@@ -367,7 +371,11 @@ def safety_check_after_move(
     """
     moveを指した後の局面（相手番）で短時間探索。
     相手番なので、info mate +N は「相手が詰ます」= 自玉が詰む → unsafe。
-    bestmove未回収でdeadlineを超えたら stop を送り、bestmoveを短時間回収して同期。
+
+    Patch:
+    - 終了時に base_position を再送して局面を復元（次のgoがposition省略でも壊れにくい）
+    - mate+ の誤検出を減らす：短手数は即unsafe / 長手数は複数回観測でunsafe
+    - safety中だけ recv timeout を短くする
     """
     if not base_position.startswith("position"):
         return False
@@ -385,12 +393,19 @@ def safety_check_after_move(
 
     unsafe = False
     t0 = time.time()
-    deadline = t0 + max(SAFETY_DEADLINE_MIN_SEC, (max(1, SAFETY_MS) / 1000.0) * SAFETY_DEADLINE_FACTOR) + SAFETY_DEADLINE_PAD_SEC
+    deadline = t0 + max(
+        SAFETY_DEADLINE_MIN_SEC,
+        (max(1, SAFETY_MS) / 1000.0) * SAFETY_DEADLINE_FACTOR
+    ) + SAFETY_DEADLINE_PAD_SEC
 
     got_bestmove = False
+    mate_pos_hits = 0  # mate+ 観測回数
+
+    # safety中は短めtimeoutで回す
+    rto = min(READ_TIMEOUT, max(0.001, SAFETY_READ_TIMEOUT))
 
     while time.time() < deadline:
-        o = eng.recv(READ_TIMEOUT)
+        o = eng.recv(rto)
         if o is None:
             continue
 
@@ -400,10 +415,21 @@ def safety_check_after_move(
                 idx = tt.index("mate")
                 m = parse_mate_token(tt[idx + 1] if idx + 1 < len(tt) else None)
                 if m is not None and m > 0:
-                    unsafe = True
+                    # 短手数は即unsafe（信頼度高）
+                    if m <= max(1, SAFETY_MATE_MAX):
+                        unsafe = True
+                    else:
+                        # 長手数は単発を弾いて、複数回ならunsafe
+                        mate_pos_hits += 1
+                        if mate_pos_hits >= max(1, SAFETY_MATE_REPEAT):
+                            unsafe = True
 
         if o.startswith("bestmove"):
             got_bestmove = True
+            break
+
+        # unsafe が確定したら早めに抜ける（重さ軽減）
+        if unsafe:
             break
 
     if not got_bestmove:
@@ -411,11 +437,14 @@ def safety_check_after_move(
         eng.send("stop")
         t_stop = time.time() + SAFETY_STOP_GRACE_SEC
         while time.time() < t_stop:
-            o = eng.recv(READ_TIMEOUT)
+            o = eng.recv(rto)
             if o is None:
                 continue
             if o.startswith("bestmove"):
                 break
+
+    # Patch: 局面復元（状態汚染防止）
+    eng.send(base_position)
 
     eng.drain()
     return unsafe
@@ -678,7 +707,6 @@ def main() -> None:
                         if abs(cp_disp) >= 20000:
                             info(f"候補{i+1}: {c.move}  cp=mate-only  win={f.winability:.2f}  {f.label}")
                         else:
-                            # best.cpが巨大でも表示崩れしないようΔは0基準にしない（読み物としてはOK）
                             delta = (_safe_best_cp(best.cp) - (0 if abs(c.cp) >= 20000 else c.cp))
                             info(f"候補{i+1}: {c.move}  cp={cp_disp:+d} Δ={delta:+d}  win={f.winability:.2f}  {f.label}")
 

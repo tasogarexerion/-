@@ -13,9 +13,12 @@ NNUE USI Proxy (YaneuraOu系想定)
     ANALYZE : 候補数増、Winability順提示
 
 [Patch (executed)]
-- safety_check_after_move の終了時に base_position を再送して局面を「必ず」復元（状態汚染防止）
-- safety_check の mate+ を “短手数は即unsafe / 長手数は複数回観測でunsafe” にして誤検出を減らす
-- safety_check 中だけ recv timeout を短くして重さを減らす（READ_TIMEOUTは変更しない）
+1) resign/win/0000 などの特殊bestmoveを safety_check 対象外にする（致命バグ回避）
+2) 候補の保持を depth 最大優先にする（浅いinfoで上書きされるフラつき対策）
+3) safety_check の stop→bestmove 同期を少しだけ堅くする（混線低減）
+4) safety_check 後の position 復元は「必要時のみ」実行（余計な重さを避ける）
+
+既存の思想・機能は削らず、より安全にした上書き版。
 """
 
 import os
@@ -24,6 +27,7 @@ import subprocess
 import threading
 import queue
 import time
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -32,7 +36,6 @@ from typing import Dict, List, Optional, Tuple
 # =========================
 ENGINE_PATH = os.environ.get("TASO_ENGINE", "./YaneuraOu")
 NNUE_PATH   = os.environ.get("TASO_NNUE", "nnue.bin")
-
 ENGINE_CMD = [ENGINE_PATH, "-eval", NNUE_PATH]
 
 THREADS = int(os.environ.get("TASO_THREADS", "6"))
@@ -62,19 +65,18 @@ LINE_LIMIT = int(os.environ.get("TASO_LINE_LIMIT", "200000"))
 GO_HARD_SEC = float(os.environ.get("TASO_GO_HARD_SEC", "60.0"))
 GO_STOP_GRACE_SEC = float(os.environ.get("TASO_GO_STOP_GRACE_SEC", "3.0"))
 
-# safety_check deadline（固定+0.6は重いので比例型）
+# safety_check deadline（比例型）
 SAFETY_DEADLINE_MIN_SEC = float(os.environ.get("TASO_SAFETY_DEADLINE_MIN_SEC", "0.20"))
 SAFETY_DEADLINE_FACTOR  = float(os.environ.get("TASO_SAFETY_DEADLINE_FACTOR", "3.0"))
 SAFETY_DEADLINE_PAD_SEC = float(os.environ.get("TASO_SAFETY_DEADLINE_PAD_SEC", "0.05"))
 SAFETY_STOP_GRACE_SEC   = float(os.environ.get("TASO_SAFETY_STOP_GRACE_SEC", "0.25"))
 
 # --- Patch knobs (new; safe defaults) ---
-# safety_check中だけ短いtimeoutを使う（重さ軽減）
 SAFETY_READ_TIMEOUT = float(os.environ.get("TASO_SAFETY_READ_TIMEOUT", "0.02"))
-# mate+ を unsafe と断定する「短手数」閾値（短い詰みほど信頼できる）
 SAFETY_MATE_MAX = int(os.environ.get("TASO_SAFETY_MATE_MAX", str(MATE_SHORT_MAX)))
-# 長手数mate+ は複数回観測でunsafe（単発誤検出を弾く）
 SAFETY_MATE_REPEAT = int(os.environ.get("TASO_SAFETY_MATE_REPEAT", "2"))
+# stop後の同期回収を伸ばしてもよい上限（混線が疑われる環境向け）
+SAFETY_STOP_HARD_CAP_SEC = float(os.environ.get("TASO_SAFETY_STOP_HARD_CAP_SEC", "0.60"))
 
 MODE_PLAY = "PLAY"
 MODE_WATCH = "WATCH"
@@ -190,6 +192,20 @@ def prefix_len(a: str, b: str, k: int = PREFIX_K) -> int:
         n += 1
     return n
 
+# USI指し手の簡易判定（安全確認に不正moveを投げないため）
+_RE_MOVE = re.compile(r"^[1-9][a-i][1-9][a-i]\+?$")            # 7g7f / 7g7f+
+_RE_DROP = re.compile(r"^[PLNSGBRK]\*[1-9][a-i]$")            # P*7f
+
+def is_special_bestmove(mv: str) -> bool:
+    mv = mv.strip().lower()
+    return mv in ("resign", "win", "0000", "(none)")
+
+def is_usi_move_token(mv: str) -> bool:
+    mv = mv.strip()
+    if not mv or is_special_bestmove(mv):
+        return False
+    return bool(_RE_MOVE.match(mv) or _RE_DROP.match(mv))
+
 @dataclass
 class Cand:
     mpv: int
@@ -197,6 +213,7 @@ class Cand:
     pv: str
     cp: int
     mate: Optional[int]
+    depth: int
 
 @dataclass
 class Features:
@@ -363,6 +380,24 @@ def rank_candidates(
 # =========================
 # Safety check (post-move)
 # =========================
+def _sync_stop_and_wait_bestmove(eng: Engine, rto: float, grace: float) -> None:
+    """
+    stop を送った後に bestmove を短時間回収して同期する。
+    回収できなくても、その後 drain で混線を減らす。
+    """
+    eng.send("stop")
+    t_stop = time.time() + max(0.01, grace)
+    hard_cap = time.time() + max(0.05, SAFETY_STOP_HARD_CAP_SEC)
+    # まずgrace、ダメならhard_capまで薄く粘る（混線回避を優先）
+    while time.time() < t_stop:
+        o = eng.recv(rto)
+        if o and o.startswith("bestmove"):
+            return
+    while time.time() < hard_cap:
+        o = eng.recv(rto)
+        if o and o.startswith("bestmove"):
+            return
+
 def safety_check_after_move(
     eng: Engine,
     base_position: str,
@@ -373,11 +408,14 @@ def safety_check_after_move(
     相手番なので、info mate +N は「相手が詰ます」= 自玉が詰む → unsafe。
 
     Patch:
-    - 終了時に base_position を再送して局面を復元（次のgoがposition省略でも壊れにくい）
+    - 終了時に base_position を必要時のみ再送して局面を復元（状態汚染防止）
     - mate+ の誤検出を減らす：短手数は即unsafe / 長手数は複数回観測でunsafe
     - safety中だけ recv timeout を短くする
     """
     if not base_position.startswith("position"):
+        return False
+    if not is_usi_move_token(move):
+        # resign/win等や不正トークンは safety 対象外（致命バグ回避）
         return False
 
     eng.drain()
@@ -404,6 +442,7 @@ def safety_check_after_move(
     # safety中は短めtimeoutで回す
     rto = min(READ_TIMEOUT, max(0.001, SAFETY_READ_TIMEOUT))
 
+    broke_early = False
     while time.time() < deadline:
         o = eng.recv(rto)
         if o is None:
@@ -419,7 +458,6 @@ def safety_check_after_move(
                     if m <= max(1, SAFETY_MATE_MAX):
                         unsafe = True
                     else:
-                        # 長手数は単発を弾いて、複数回ならunsafe
                         mate_pos_hits += 1
                         if mate_pos_hits >= max(1, SAFETY_MATE_REPEAT):
                             unsafe = True
@@ -430,21 +468,17 @@ def safety_check_after_move(
 
         # unsafe が確定したら早めに抜ける（重さ軽減）
         if unsafe:
+            broke_early = True
             break
 
-    if not got_bestmove:
-        # 探索が残って混線するのが一番危険なので stop → bestmove回収で同期
-        eng.send("stop")
-        t_stop = time.time() + SAFETY_STOP_GRACE_SEC
-        while time.time() < t_stop:
-            o = eng.recv(rto)
-            if o is None:
-                continue
-            if o.startswith("bestmove"):
-                break
+    # bestmove未回収 or 早抜け は stop→bestmove回収で同期
+    if not got_bestmove or broke_early:
+        _sync_stop_and_wait_bestmove(eng, rto, SAFETY_STOP_GRACE_SEC)
 
-    # Patch: 局面復元（状態汚染防止）
-    eng.send(base_position)
+    # 必要時のみ「局面復元」
+    # - stopを投げた（＝同期処理をした）/ 早抜け / bestmove未回収だった場合に限定
+    if (not got_bestmove) or broke_early:
+        eng.send(base_position)
 
     eng.drain()
     return unsafe
@@ -552,6 +586,7 @@ def main() -> None:
                 apply_engine_opts()
                 eng.send(line)
 
+                # depth最大優先で保持（mpvごとに安定化）
                 cands_map: Dict[int, Cand] = {}
                 best_engine_move: Optional[str] = None
 
@@ -581,20 +616,32 @@ def main() -> None:
                         out(o)
 
                         tt = o.split()
+
+                        # depth
+                        depth = 0
+                        if "depth" in tt:
+                            d = _try_int(tt[tt.index("depth") + 1] if tt.index("depth") + 1 < len(tt) else "")
+                            if d is not None:
+                                depth = d
+
+                        # mpv
                         mpv = 1
                         if "multipv" in tt:
                             m = _try_int(tt[tt.index("multipv") + 1] if tt.index("multipv") + 1 < len(tt) else "")
                             if m is not None:
                                 mpv = m
 
+                        # cp
                         cp = None
                         if "score" in tt and "cp" in tt:
                             cp = _try_int(tt[tt.index("cp") + 1] if tt.index("cp") + 1 < len(tt) else "")
 
+                        # mate
                         mate = None
                         if "mate" in tt:
                             mate = parse_mate_token(tt[tt.index("mate") + 1] if tt.index("mate") + 1 < len(tt) else None)
 
+                        # pv
                         if "pv" in tt:
                             i_pv = tt.index("pv")
                             if i_pv + 1 < len(tt):
@@ -608,7 +655,9 @@ def main() -> None:
                                     else:
                                         cp = 0
 
-                                cands_map[mpv] = Cand(mpv=mpv, move=mv, pv=pv, cp=cp, mate=mate)
+                                prev = cands_map.get(mpv)
+                                if prev is None or depth >= prev.depth:
+                                    cands_map[mpv] = Cand(mpv=mpv, move=mv, pv=pv, cp=cp, mate=mate, depth=depth)
                         continue
 
                     if o.startswith("bestmove"):
@@ -666,13 +715,16 @@ def main() -> None:
                         break
 
                 # 頓死回避 第2段：着手後安全確認（短時間）
-                if SAFETY_MS > 0 and current_position:
+                # resign/win/0000 等は safety 対象外（致命バグ回避）
+                if SAFETY_MS > 0 and current_position and is_usi_move_token(chosen):
                     unsafe = safety_check_after_move(eng, current_position, chosen)
                     if unsafe:
                         info(f"☠ safety-check failed for {chosen} -> fallback")
                         alt = None
                         for c in ranked[: min(5, len(ranked))]:
                             if c.move == chosen:
+                                continue
+                            if not is_usi_move_token(c.move):
                                 continue
                             if safety_check_after_move(eng, current_position, c.move):
                                 continue
@@ -702,7 +754,6 @@ def main() -> None:
                     for i in range(show_n):
                         c = ranked[i]
                         f = feats_by_move[c.move]
-                        # 表示は生cp（ただし巨大cpは注釈）
                         cp_disp = c.cp
                         if abs(cp_disp) >= 20000:
                             info(f"候補{i+1}: {c.move}  cp=mate-only  win={f.winability:.2f}  {f.label}")

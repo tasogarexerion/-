@@ -388,7 +388,6 @@ def _sync_stop_and_wait_bestmove(eng: Engine, rto: float, grace: float) -> None:
     eng.send("stop")
     t_stop = time.time() + max(0.01, grace)
     hard_cap = time.time() + max(0.05, SAFETY_STOP_HARD_CAP_SEC)
-    # まずgrace、ダメならhard_capまで薄く粘る（混線回避を優先）
     while time.time() < t_stop:
         o = eng.recv(rto)
         if o and o.startswith("bestmove"):
@@ -415,7 +414,6 @@ def safety_check_after_move(
     if not base_position.startswith("position"):
         return False
     if not is_usi_move_token(move):
-        # resign/win等や不正トークンは safety 対象外（致命バグ回避）
         return False
 
     eng.drain()
@@ -437,9 +435,8 @@ def safety_check_after_move(
     ) + SAFETY_DEADLINE_PAD_SEC
 
     got_bestmove = False
-    mate_pos_hits = 0  # mate+ 観測回数
+    mate_pos_hits = 0
 
-    # safety中は短めtimeoutで回す
     rto = min(READ_TIMEOUT, max(0.001, SAFETY_READ_TIMEOUT))
 
     broke_early = False
@@ -454,7 +451,6 @@ def safety_check_after_move(
                 idx = tt.index("mate")
                 m = parse_mate_token(tt[idx + 1] if idx + 1 < len(tt) else None)
                 if m is not None and m > 0:
-                    # 短手数は即unsafe（信頼度高）
                     if m <= max(1, SAFETY_MATE_MAX):
                         unsafe = True
                     else:
@@ -466,17 +462,13 @@ def safety_check_after_move(
             got_bestmove = True
             break
 
-        # unsafe が確定したら早めに抜ける（重さ軽減）
         if unsafe:
             broke_early = True
             break
 
-    # bestmove未回収 or 早抜け は stop→bestmove回収で同期
     if not got_bestmove or broke_early:
         _sync_stop_and_wait_bestmove(eng, rto, SAFETY_STOP_GRACE_SEC)
 
-    # 必要時のみ「局面復元」
-    # - stopを投げた（＝同期処理をした）/ 早抜け / bestmove未回収だった場合に限定
     if (not got_bestmove) or broke_early:
         eng.send(base_position)
 
@@ -533,7 +525,7 @@ def main() -> None:
                     value = ""
                     if "value" in toks:
                         j = toks.index("value")
-                        value = " ".join(toks[j + 1 :]) if j + 1 < len(toks) else ""
+                        value = " ".join(toks[j + 1:]) if j + 1 < len(toks) else ""
 
                     if name == "TASO_Mode":
                         v = value.strip().upper()
@@ -580,13 +572,11 @@ def main() -> None:
                 continue
 
             if line.startswith("go"):
-                # go開始前に残骸を捨てる（安全確認などの混線対策）
                 eng.drain()
 
                 apply_engine_opts()
                 eng.send(line)
 
-                # depth最大優先で保持（mpvごとに安定化）
                 cands_map: Dict[int, Cand] = {}
                 best_engine_move: Optional[str] = None
 
@@ -595,12 +585,10 @@ def main() -> None:
                 already_resigned = False
 
                 for _ in range(LINE_LIMIT):
-                    # ハードタイムアウト
                     if time.time() - t_go > GO_HARD_SEC:
                         if not sent_stop:
                             eng.send("stop")
                             sent_stop = True
-                            # stop後は少しだけbestmove待つ
                             t_go = time.time() - (GO_HARD_SEC - GO_STOP_GRACE_SEC)
                         else:
                             info("⚠ go timeout: bestmove not returned -> resign")
@@ -614,41 +602,34 @@ def main() -> None:
 
                     if o.startswith("info"):
                         out(o)
-
                         tt = o.split()
 
-                        # depth
                         depth = 0
                         if "depth" in tt:
                             d = _try_int(tt[tt.index("depth") + 1] if tt.index("depth") + 1 < len(tt) else "")
                             if d is not None:
                                 depth = d
 
-                        # mpv
                         mpv = 1
                         if "multipv" in tt:
                             m = _try_int(tt[tt.index("multipv") + 1] if tt.index("multipv") + 1 < len(tt) else "")
                             if m is not None:
                                 mpv = m
 
-                        # cp
                         cp = None
                         if "score" in tt and "cp" in tt:
                             cp = _try_int(tt[tt.index("cp") + 1] if tt.index("cp") + 1 < len(tt) else "")
 
-                        # mate
                         mate = None
                         if "mate" in tt:
                             mate = parse_mate_token(tt[tt.index("mate") + 1] if tt.index("mate") + 1 < len(tt) else None)
 
-                        # pv
                         if "pv" in tt:
                             i_pv = tt.index("pv")
                             if i_pv + 1 < len(tt):
-                                pv = " ".join(tt[i_pv + 1 :])
+                                pv = " ".join(tt[i_pv + 1:])
                                 mv = tt[i_pv + 1]
 
-                                # cp欠損時の暫定（mate優先、ただし相対計算でガードする）
                                 if cp is None:
                                     if mate is not None:
                                         cp = 30000 if mate > 0 else -30000
@@ -679,22 +660,18 @@ def main() -> None:
                     out(f"bestmove {best_engine_move}")
                     continue
 
-                # bestはmpv1優先
                 best = cands_map[1] if 1 in cands_map else max(cands, key=lambda c: c.cp)
 
-                # 頓死回避 第1段：見えてる自玉mate負は候補から落とす（表示用候補）
                 safe_cands = [c for c in cands if not (c.mate is not None and c.mate < 0)]
                 if not safe_cands:
                     safe_cands = cands
 
-                # short mateの検出（表示用）
                 short_mate = None
                 for c in safe_cands:
                     if c.mate is not None and c.mate > 0:
                         if short_mate is None or c.mate < short_mate[0]:
                             short_mate = (c.mate, c.move)
 
-                # 特徴量は「フィルタ前のcands」をcontextとして使う（mate負気配を拾う）
                 tmp_best_feat = compute_features(best, best, cands, "BALANCE")
                 phase_mode = decide_mode_from_best(tmp_best_feat)
 
@@ -704,18 +681,14 @@ def main() -> None:
 
                 ranked = rank_candidates(safe_cands, feats_by_move, best, phase_mode)
 
-                # ===== bestmove（指す手）は強さ維持 =====
                 chosen = best_engine_move
 
-                # エンジンbestがPV内で自玉mate負なら、最良のsafeへ
                 for c in cands:
                     if c.move == chosen and (c.mate is not None and c.mate < 0):
                         info("⚠ bestmove shows self-mate in PV -> fallback to safest")
                         chosen = max(safe_cands, key=lambda x: x.cp).move
                         break
 
-                # 頓死回避 第2段：着手後安全確認（短時間）
-                # resign/win/0000 等は safety 対象外（致命バグ回避）
                 if SAFETY_MS > 0 and current_position and is_usi_move_token(chosen):
                     unsafe = safety_check_after_move(eng, current_position, chosen)
                     if unsafe:
@@ -735,7 +708,6 @@ def main() -> None:
                         else:
                             info("☠ no alternative passed safety-check (keep chosen)")
 
-                # ===== 表示（候補提示） =====
                 if user_mode == MODE_PLAY:
                     f_best = feats_by_move.get(best.move)
                     if f_best:

@@ -9,8 +9,8 @@ NNUE USI Proxy (YaneuraOu系想定)
 - 低Winability時は Initiative 重視の「下駄を預ける」候補も提示対象
 - モード：
     PLAY    : bestmove最強維持（安全のみ）、候補表示は最小
-    WATCH   : bestmove最強維持（安全のみ）、候補表示＋ラベル＋ストーリー
-    ANALYZE : 候補数増、Winability順提示
+    WATCH   : bestmove最強維持（安全のみ）、候補表示＋役割＋方針ストーリー
+    ANALYZE : 候補数増、Winability順提示（内訳も）
 
 [Patch (executed)]
 - safety_check_after_move の終了時に base_position を再送して局面を「必ず」復元（状態汚染防止）
@@ -21,6 +21,10 @@ NNUE USI Proxy (YaneuraOu系想定)
 - USI stdin を別スレッドで読む：go中でも stop/ponderhit/quit を即座に処理（USI的に必須）
 - 子エンジン起動の cwd をこのスクリプトのフォルダに固定（eval/book相対パスの安定化）
 - エンジンが実際に持つ option を usi 出力から収集し、存在するものだけ setoption（No such option排除）
+- 表示の改善：
+    - 「方針（ストーリー）」を1行で表示（ヒステリシスでブレにくい）
+    - 候補は「役割ラベル」で表示（本線/手堅い/圧/揺さぶり/粘り/勝負手）
+    - 候補手を将棋表記（例：７六歩）＋USI併記に変換（簡易KIF）
 """
 
 import os
@@ -30,7 +34,7 @@ import threading
 import queue
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Any
 
 # =========================
 # PATH / CWD 固定
@@ -48,12 +52,11 @@ def _abspath_under_script(p: str) -> str:
 # CONFIG (環境変数で上書き可)
 # =========================
 ENGINE_PATH = os.environ.get("TASO_ENGINE", "./YaneuraOu")
-NNUE_PATH   = os.environ.get("TASO_NNUE", "eval")  # ← 安全側のデフォルト：evalフォルダ
+NNUE_PATH   = os.environ.get("TASO_NNUE", "eval")  # evalフォルダ想定が安全
 
 ENGINE_PATH_ABS = _abspath_under_script(ENGINE_PATH)
 NNUE_PATH_ABS   = _abspath_under_script(NNUE_PATH)
 
-# エンジン起動引数（やねうら王系）
 ENGINE_CMD = [ENGINE_PATH_ABS, "-eval", NNUE_PATH_ABS]
 
 THREADS = int(os.environ.get("TASO_THREADS", "6"))
@@ -94,9 +97,20 @@ SAFETY_READ_TIMEOUT = float(os.environ.get("TASO_SAFETY_READ_TIMEOUT", "0.02"))
 SAFETY_MATE_MAX = int(os.environ.get("TASO_SAFETY_MATE_MAX", str(MATE_SHORT_MAX)))
 SAFETY_MATE_REPEAT = int(os.environ.get("TASO_SAFETY_MATE_REPEAT", "2"))
 
-# book が無いなら自動でOFF（ノイズ削減・挙動は変えない）
+# book が無いなら自動でOFF（ノイズ削減）
 AUTO_DISABLE_BOOK = os.environ.get("TASO_AUTO_DISABLE_BOOK", "1") == "1"
 BOOK_FILE = os.path.join(SCRIPT_DIR, "book", "standard_book.db")
+
+# 表示: 将棋表記に変換するか
+SHOW_KIF = os.environ.get("TASO_SHOW_KIF", "1") == "1"
+
+# 方針（phase）ヒステリシス（ブレ防止）
+PH_STABLE_ENTER = float(os.environ.get("TASO_PH_STABLE_ENTER", "0.78"))
+PH_STABLE_EXIT  = float(os.environ.get("TASO_PH_STABLE_EXIT",  "0.72"))
+PH_BAL_ENTER    = float(os.environ.get("TASO_PH_BAL_ENTER",    "0.58"))
+PH_BAL_EXIT     = float(os.environ.get("TASO_PH_BAL_EXIT",     "0.52"))
+PH_DIST_ENTER   = float(os.environ.get("TASO_PH_DIST_ENTER",   "0.38"))
+PH_DIST_EXIT    = float(os.environ.get("TASO_PH_DIST_EXIT",    "0.32"))
 
 MODE_PLAY = "PLAY"
 MODE_WATCH = "WATCH"
@@ -172,10 +186,10 @@ class Engine:
             ENGINE_CMD,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,  # 必要なら DEVNULL -> None にして見る
+            stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
-            cwd=SCRIPT_DIR,  # ★重要：eval/ book の相対パスを安定させる
+            cwd=SCRIPT_DIR,  # ★重要：eval/ book の相対パスを安定
         )
         self.q: queue.Queue[str] = queue.Queue()
         self.alive = True
@@ -263,13 +277,15 @@ class Features:
     self_risk: float
     initiative: float
     winability: float
-    label: str
+    label: str          # 旧ラベル互換（残す）
+    roles: str          # 新：役割ラベル（見やすい）
+    divergence: float   # 新：分岐度（表示・役割判定用）
 
 def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 # =========================
-# Winability v1.1
+# Winability v1.1（中身は維持）
 # =========================
 def mate_risk(d: int) -> float:
     import math
@@ -281,6 +297,78 @@ def mate_initiative(d: int) -> float:
 
 def _safe_best_cp(best_cp: int) -> int:
     return 0 if abs(best_cp) >= 20000 else best_cp
+
+def _legacy_label(winability: float, stability: float, self_risk: float, initiative: float) -> str:
+    # 旧表示を残す（互換用）。表示は新 roles を使う。
+    if winability >= 0.75:
+        tier = "安定勝ち"
+    elif winability >= 0.55:
+        tier = "勝負"
+    elif winability >= 0.35:
+        tier = "嫌味勝負"
+    else:
+        tier = "逆転狙い"
+
+    if initiative >= 0.70 and self_risk <= 0.60:
+        style = "攻め"
+    elif stability >= 0.60 and self_risk <= 0.60:
+        style = "安定"
+    elif initiative >= 0.60 and self_risk >= 0.70:
+        style = "開き直り"
+    else:
+        style = "バランス"
+
+    return f"{tier}/{style}"
+
+def _roles_label(
+    *,
+    is_best: bool,
+    stability: float,
+    self_risk: float,
+    initiative: float,
+    divergence: float,
+    phase_mode: str,
+) -> str:
+    """
+    見やすさ優先の「役割ラベル」。
+    - 局面方針（phase_mode）とは別軸で、候補が担う役割を短い語で出す。
+    """
+    roles: List[str] = []
+
+    # 本線：best PVに近い / 読み筋の中心
+    if is_best or stability >= 0.66:
+        roles.append("本線")
+
+    # 手堅い：事故りにくい
+    if self_risk <= 0.35 and stability >= 0.35:
+        roles.append("手堅い")
+
+    # 圧：相手に対応を強いがち
+    if initiative >= 0.65 and self_risk <= 0.80:
+        roles.append("圧")
+
+    # 揺さぶり：分岐が大きく判断を要求
+    if divergence >= 0.60 and initiative >= 0.45:
+        roles.append("揺さぶり")
+
+    # 粘り：不利側での事故回避＋形を保つ
+    if phase_mode in ("DISTURB", "DESPERATE"):
+        if self_risk <= 0.55 and stability >= 0.25 and "揺さぶり" not in roles:
+            roles.append("粘り")
+
+    # 勝負手：多少のリスクを許容して逆転要素を残す
+    if (initiative >= 0.60 and self_risk >= 0.60) or (phase_mode == "DESPERATE" and divergence >= 0.50):
+        roles.append("勝負手")
+
+    # 役割が多すぎると読めないので、強い順で最大2つ
+    priority = ["本線", "手堅い", "圧", "揺さぶり", "粘り", "勝負手"]
+    uniq: List[str] = []
+    for p in priority:
+        if p in roles and p not in uniq:
+            uniq.append(p)
+    uniq = uniq[:2] if uniq else ["本線"]
+
+    return "/".join(uniq)
 
 def compute_features(
     cand: Cand,
@@ -294,6 +382,7 @@ def compute_features(
 
     pv_pref = prefix_len(best.pv, cand.pv, PREFIX_K)
     stability = clamp(pv_pref / float(max(1, PREFIX_K)))
+    divergence = clamp((PREFIX_K - pv_pref) / float(max(1, PREFIX_K)))
 
     good = 0
     for c in context_cands:
@@ -329,7 +418,6 @@ def compute_features(
 
     initiative = max(initiative, clamp(1.0 - min(1.0, good / 5.0)))
 
-    divergence = clamp((PREFIX_K - pv_pref) / float(max(1, PREFIX_K)))
     if mode_hint in ("DISTURB", "DESPERATE"):
         initiative = clamp(initiative + 0.25 * divergence)
 
@@ -341,40 +429,59 @@ def compute_features(
     )
     winability = clamp(win)
 
-    if winability >= 0.75:
-        tier = "安定勝ち"
-    elif winability >= 0.55:
-        tier = "勝負"
-    elif winability >= 0.35:
-        tier = "嫌味勝負"
-    else:
-        tier = "逆転狙い"
+    legacy = _legacy_label(winability, stability, self_risk, initiative)
+    roles = _roles_label(
+        is_best=(cand.move == best.move),
+        stability=stability,
+        self_risk=self_risk,
+        initiative=initiative,
+        divergence=divergence,
+        phase_mode=mode_hint,
+    )
 
-    if initiative >= 0.70 and self_risk <= 0.60:
-        style = "攻め"
-    elif stability >= 0.60 and self_risk <= 0.60:
-        style = "安定"
-    elif initiative >= 0.60 and self_risk >= 0.70:
-        style = "開き直り"
-    else:
-        style = "バランス"
-
-    label = f"{tier}/{style}"
-    return Features(stability, opp_diff, self_risk, initiative, winability, label)
+    return Features(stability, opp_diff, self_risk, initiative, winability, legacy, roles, divergence)
 
 # =========================
-# Candidate selection rules
+# Phase hysteresis + narrative
 # =========================
-def decide_mode_from_best(best_feat: Features) -> str:
-    w = best_feat.winability
-    if w >= 0.75:
-        return "STABLE"
-    if w >= 0.55:
-        return "BALANCE"
-    if w >= 0.35:
-        return "DISTURB"
-    return "DESPERATE"
+class PhaseHysteresis:
+    def __init__(self) -> None:
+        self.phase: str = "BALANCE"
 
+    def update(self, w: float) -> str:
+        p = self.phase
+
+        if p == "STABLE":
+            if w < PH_STABLE_EXIT:
+                self.phase = "BALANCE"
+        elif p == "BALANCE":
+            if w >= PH_STABLE_ENTER:
+                self.phase = "STABLE"
+            elif w < PH_BAL_EXIT:
+                self.phase = "DISTURB"
+        elif p == "DISTURB":
+            if w >= PH_BAL_ENTER:
+                self.phase = "BALANCE"
+            elif w < PH_DIST_EXIT:
+                self.phase = "DESPERATE"
+        else:  # DESPERATE
+            if w >= PH_DIST_ENTER:
+                self.phase = "DISTURB"
+
+        return self.phase
+
+def phase_plan_text(phase: str) -> str:
+    if phase == "STABLE":
+        return "方針: 手堅く優勢維持（崩れにくさ重視）"
+    if phase == "BALANCE":
+        return "方針: 本線で積み上げ（自然に良くする）"
+    if phase == "DISTURB":
+        return "方針: 主導権を取りにいく（相手に対応を強制）"
+    return "方針: 逆転要素を残す（揺さぶり/詰めろで勝負）"
+
+# =========================
+# Candidate ranking（既存ロジック維持）
+# =========================
 def rank_candidates(
     cands: List[Cand],
     feats: Dict[str, Features],
@@ -456,6 +563,7 @@ def safety_check_after_move(
             if "mate" in tt:
                 idx = tt.index("mate")
                 m = parse_mate_token(tt[idx + 1] if idx + 1 < len(tt) else None)
+                # 相手番なので mate+ は危険
                 if m is not None and m > 0:
                     if m <= max(1, SAFETY_MATE_MAX):
                         unsafe = True
@@ -481,6 +589,7 @@ def safety_check_after_move(
             if o.startswith("bestmove"):
                 break
 
+    # 局面復元（状態汚染防止）
     eng.send(base_position)
     eng.drain()
     return unsafe
@@ -489,7 +598,6 @@ def safety_check_after_move(
 # USI option collector
 # =========================
 def _parse_option_name(line: str) -> Optional[str]:
-    # example: "option name Threads type spin default 4 ..."
     if not line.startswith("option "):
         return None
     tt = line.split()
@@ -499,6 +607,213 @@ def _parse_option_name(line: str) -> Optional[str]:
     if i + 1 >= len(tt):
         return None
     return tt[i + 1]
+
+# =========================
+# --- Shogi board: USI move -> 簡易KIF ---
+# =========================
+FILES_FW = "０１２３４５６７８９"  # index 1..9
+RANK_KANJI = ["", "一", "二", "三", "四", "五", "六", "七", "八", "九"]
+
+PIECE_JP = {
+    "P": "歩", "L": "香", "N": "桂", "S": "銀", "G": "金", "B": "角", "R": "飛", "K": "玉",
+    "+P": "と", "+L": "成香", "+N": "成桂", "+S": "成銀", "+B": "馬", "+R": "龍",
+}
+
+def _sq_to_xy(sq: str) -> Optional[Tuple[int, int]]:
+    # USI square: file(1-9) + rank(a-i)
+    if len(sq) != 2:
+        return None
+    f = _try_int(sq[0])
+    r = ord(sq[1]) - ord("a") + 1
+    if f is None or not (1 <= f <= 9) or not (1 <= r <= 9):
+        return None
+    # board index: [rank][file] 1..9
+    return (f, r)
+
+def _xy_to_kif(f: int, r: int) -> str:
+    return f"{FILES_FW[f]}{RANK_KANJI[r]}"
+
+def _unpromote(p: str) -> str:
+    return p[1:] if p.startswith("+") else p
+
+def _promote(p: str) -> str:
+    if p.startswith("+"):
+        return p
+    if p in ("P", "L", "N", "S", "B", "R"):
+        return "+" + p
+    return p
+
+def _parse_sfen_board(board_sfen: str) -> List[List[Optional[Tuple[str, str]]]]:
+    """
+    return board[rank 1..9][file 1..9] => (side 'b'/'w', piece code like 'P' '+B')
+    SFEN ranks are separated by '/', from rank1 to rank9.
+    """
+    ranks = board_sfen.split("/")
+    board: List[List[Optional[Tuple[str, str]]]] = [[None for _ in range(10)] for _ in range(10)]
+    if len(ranks) != 9:
+        return board
+
+    for r_idx, row in enumerate(ranks, start=1):
+        f = 1
+        i = 0
+        while i < len(row) and f <= 9:
+            ch = row[i]
+            if ch.isdigit():
+                f += int(ch)
+                i += 1
+                continue
+            promo = False
+            if ch == "+":
+                promo = True
+                i += 1
+                if i >= len(row):
+                    break
+                ch = row[i]
+
+            side = "b" if ch.isupper() else "w"
+            pc = ch.upper()
+            piece = ("+" + pc) if promo else pc
+            board[r_idx][f] = (side, piece)
+            f += 1
+            i += 1
+
+    return board
+
+def _init_startpos_board() -> List[List[Optional[Tuple[str, str]]]]:
+    # SFEN startpos:
+    sfen = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL"
+    return _parse_sfen_board(sfen)
+
+def _clone_board(board: List[List[Optional[Tuple[str, str]]]]) -> List[List[Optional[Tuple[str, str]]]]:
+    return [row[:] for row in board]
+
+def _apply_usi_move(
+    board: List[List[Optional[Tuple[str, str]]]],
+    side_to_move: str,
+    move: str
+) -> Tuple[List[List[Optional[Tuple[str, str]]]], str]:
+    """
+    Apply move to board (very lightweight, no full legality checks).
+    Returns (new_board, moved_piece_code_after)
+    """
+    b2 = _clone_board(board)
+
+    # drop: "P*7f"
+    if "*" in move:
+        pc = move[0].upper()
+        dst = move.split("*", 1)[1]
+        xy = _sq_to_xy(dst)
+        piece = pc
+        if xy:
+            f, r = xy
+            b2[r][f] = (side_to_move, piece)
+        return b2, piece
+
+    # normal: "7g7f" or "7g7f+"
+    prom = move.endswith("+")
+    core = move[:-1] if prom else move
+    if len(core) != 4:
+        return b2, "P"
+
+    src = core[:2]
+    dst = core[2:]
+    sxy = _sq_to_xy(src)
+    dxy = _sq_to_xy(dst)
+    if not sxy or not dxy:
+        return b2, "P"
+
+    sf, sr = sxy
+    df, dr = dxy
+
+    sp = b2[sr][sf]
+    if sp is None:
+        # fallback: unknown
+        moved = "P"
+    else:
+        _, moved = sp
+
+    # remove src
+    b2[sr][sf] = None
+
+    # promotion
+    moved_after = _promote(moved) if prom else moved
+
+    # place dst
+    b2[dr][df] = (side_to_move, moved_after)
+    return b2, moved_after
+
+def usi_move_to_kif(
+    base_position: str,
+    usi_move: str
+) -> str:
+    """
+    Convert a single USI move into readable Japanese-like notation: ７六歩 / ５五角成 / ７七銀打 etc.
+    This is "simple KIF": no 同 / 右左寄引 / 成不成の選択理由までは出さない。
+    """
+    if not SHOW_KIF:
+        return usi_move
+
+    # Build board from base_position
+    board = _init_startpos_board()
+    side = "b"
+
+    toks = base_position.split()
+    if not toks or toks[0] != "position":
+        return usi_move
+
+    i = 1
+    if i < len(toks) and toks[i] == "startpos":
+        board = _init_startpos_board()
+        side = "b"
+        i += 1
+    elif i < len(toks) and toks[i] == "sfen":
+        # position sfen <board> <side> <hand> <move#> [moves ...]
+        if i + 4 < len(toks):
+            board_sfen = toks[i + 1]
+            side_sfen = toks[i + 2]
+            board = _parse_sfen_board(board_sfen)
+            side = "b" if side_sfen == "b" else "w"
+        i += 5
+    else:
+        return usi_move
+
+    # apply existing moves to reach current position
+    if "moves" in toks:
+        m_idx = toks.index("moves") + 1
+        seq = toks[m_idx:]
+        for mv in seq:
+            board, _ = _apply_usi_move(board, side, mv)
+            side = "w" if side == "b" else "b"
+
+    # now convert this move (do not mutate original)
+    side_to_move = side
+    board_after, moved_piece = _apply_usi_move(board, side_to_move, usi_move)
+
+    # destination square
+    # drop
+    if "*" in usi_move:
+        pc = usi_move[0].upper()
+        dst = usi_move.split("*", 1)[1]
+        dxy = _sq_to_xy(dst)
+        if not dxy:
+            return usi_move
+        df, dr = dxy
+        piece_jp = PIECE_JP.get(pc, pc)
+        return f"{_xy_to_kif(df, dr)}{piece_jp}打"
+
+    prom = usi_move.endswith("+")
+    core = usi_move[:-1] if prom else usi_move
+    if len(core) != 4:
+        return usi_move
+    dst = core[2:]
+    dxy = _sq_to_xy(dst)
+    if not dxy:
+        return usi_move
+
+    df, dr = dxy
+    piece_jp = PIECE_JP.get(moved_piece, PIECE_JP.get(_unpromote(moved_piece), moved_piece))
+    suffix = "成" if prom else ""
+    return f"{_xy_to_kif(df, dr)}{piece_jp}{suffix}"
 
 # =========================
 # Main USI loop
@@ -512,18 +827,18 @@ def main() -> None:
     multipv = DEFAULT_MULTIPV
 
     supported_opts: Set[str] = set()
+    phase_hys = PhaseHysteresis()
 
     def send_opt(name: str, value: str) -> None:
         if name in supported_opts:
             eng.send(f"setoption name {name} value {value}")
 
     def apply_engine_opts():
-        # ここは存在する option だけ送る（No such option を根絶）
         send_opt("Threads", str(THREADS))
         send_opt("USI_Hash", str(HASH_MB))
         send_opt("MultiPV", str(multipv))
 
-        # book が無いなら ownbook を落とす（ノイズ削減）
+        # book が無いなら ownbook を落とす
         if AUTO_DISABLE_BOOK and not os.path.isfile(BOOK_FILE):
             send_opt("USI_OwnBook", "false")
 
@@ -576,7 +891,6 @@ def main() -> None:
                     if o is None:
                         continue
 
-                    # option収集
                     if o.startswith("option "):
                         name = _parse_option_name(o)
                         if name:
@@ -637,7 +951,7 @@ def main() -> None:
                 t_go = time.time()
                 sent_stop = False
                 already_resigned = False
-                deferred: List[str] = []  # go中に来た stop/quit 以外は後で処理（原則来ないが保険）
+                deferred: List[str] = []
 
                 while True:
                     # 1) go中に stdin をポーリング（stop/ponderhit/quit 即応）
@@ -712,7 +1026,7 @@ def main() -> None:
 
                     out(o)
 
-                # goが終わった後、deferredを先頭に戻したいが、USI的には通常来ないので処理だけする
+                # goが終わった後、deferredを処理（通常は来ないが保険）
                 for cmd in deferred:
                     if cmd.startswith("setoption"):
                         if not handle_setoption(cmd):
@@ -725,7 +1039,6 @@ def main() -> None:
                     elif cmd == "quit":
                         eng.send("quit")
                         return
-                    # それ以外は無視
 
                 if already_resigned:
                     continue
@@ -741,18 +1054,22 @@ def main() -> None:
 
                 best = cands_map[1] if 1 in cands_map else max(cands, key=lambda c: c.cp)
 
+                # 頓死回避 第1段：見えてる自玉mate負は候補から落とす（表示用候補）
                 safe_cands = [c for c in cands if not (c.mate is not None and c.mate < 0)]
                 if not safe_cands:
                     safe_cands = cands
 
+                # short mateの検出（表示用）
                 short_mate = None
                 for c in safe_cands:
                     if c.mate is not None and c.mate > 0:
                         if short_mate is None or c.mate < short_mate[0]:
                             short_mate = (c.mate, c.move)
 
+                # --- 方針（phase）をヒステリシスで更新 ---
                 tmp_best_feat = compute_features(best, best, cands, "BALANCE")
-                phase_mode = decide_mode_from_best(tmp_best_feat)
+                phase_mode = phase_hys.update(tmp_best_feat.winability)
+                plan_text = phase_plan_text(phase_mode)
 
                 feats_by_move: Dict[str, Features] = {}
                 for c in safe_cands:
@@ -760,14 +1077,17 @@ def main() -> None:
 
                 ranked = rank_candidates(safe_cands, feats_by_move, best, phase_mode)
 
+                # ===== bestmove（指す手）は強さ維持 =====
                 chosen = best_engine_move
 
+                # エンジンbestがPV内で自玉mate負なら、最良のsafeへ
                 for c in cands:
                     if c.move == chosen and (c.mate is not None and c.mate < 0):
                         info("⚠ bestmove shows self-mate in PV -> fallback to safest")
                         chosen = max(safe_cands, key=lambda x: x.cp).move
                         break
 
+                # 頓死回避 第2段：着手後安全確認（短時間）
                 if SAFETY_MS > 0 and current_position:
                     unsafe = safety_check_after_move(eng, current_position, chosen)
                     if unsafe:
@@ -785,48 +1105,59 @@ def main() -> None:
                         else:
                             info("☠ no alternative passed safety-check (keep chosen)")
 
-                # 表示
+                # ===== 表示（候補提示） =====
+                def fmt_move(mv: str) -> str:
+                    if not current_position:
+                        return mv
+                    kif = usi_move_to_kif(current_position, mv)
+                    if kif == mv:
+                        return mv
+                    return f"{kif}({mv})"
+
+                f_best = feats_by_move.get(best.move)
+                if user_mode in (MODE_PLAY, MODE_WATCH, MODE_ANALYZE) and f_best:
+                    info(f"[TASO] {plan_text}  (phase={phase_mode})  win(bestPV)={f_best.winability:.2f}")
+
+                if short_mate and short_mate[0] <= MATE_SHORT_MAX:
+                    info(f"⚡ short-mate seen: mate {short_mate[0]} (pv move {fmt_move(short_mate[1])})")
+
                 if user_mode == MODE_PLAY:
-                    f_best = feats_by_move.get(best.move)
-                    if f_best:
-                        info(f"[TASO] phase={phase_mode} win(bestPV)={f_best.winability:.2f} {f_best.label}")
-                    if short_mate and short_mate[0] <= MATE_SHORT_MAX:
-                        info(f"⚡ short-mate seen: mate {short_mate[0]} (pv move {short_mate[1]})")
+                    # PLAYは最小限（方針＋短詰み程度）
+                    pass
 
                 elif user_mode == MODE_WATCH:
-                    f_best = feats_by_move.get(best.move)
-                    if f_best:
-                        info(f"[TASO] phase={phase_mode} win(bestPV)={f_best.winability:.2f} {f_best.label}")
-                    if short_mate and short_mate[0] <= MATE_SHORT_MAX:
-                        info(f"⚡ short-mate seen: mate {short_mate[0]} (pv move {short_mate[1]})")
-
                     show_n = min(3, len(ranked))
                     for i in range(show_n):
                         c = ranked[i]
                         f = feats_by_move[c.move]
+
+                        mv_disp = fmt_move(c.move)
+                        roles = f.roles
+
                         if abs(c.cp) >= 20000:
-                            info(f"候補{i+1}: {c.move}  cp=mate-only  win={f.winability:.2f}  {f.label}")
+                            info(f"候補{i+1}: {mv_disp}  役割={roles}  cp=mate-only  win={f.winability:.2f}")
                         else:
                             delta = (_safe_best_cp(best.cp) - (0 if abs(c.cp) >= 20000 else c.cp))
-                            info(f"候補{i+1}: {c.move}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f}  {f.label}")
+                            info(f"候補{i+1}: {mv_disp}  役割={roles}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f}")
 
                 else:  # ANALYZE
-                    f_best = feats_by_move.get(best.move)
-                    if f_best:
-                        info(f"[TASO] phase={phase_mode} win(bestPV)={f_best.winability:.2f} {f_best.label}")
                     show_n = min(max(5, multipv), len(ranked))
                     for i in range(show_n):
                         c = ranked[i]
                         f = feats_by_move[c.move]
+                        mv_disp = fmt_move(c.move)
+
                         if abs(c.cp) >= 20000:
-                            info(f"[{i+1}] {c.move}  cp=mate-only  win={f.winability:.2f} "
-                                 f"(stab={f.stability:.2f} diff={f.opp_diff:.2f} risk={f.self_risk:.2f} init={f.initiative:.2f}) "
-                                 f"{f.label}")
+                            info(
+                                f"[{i+1}] {mv_disp}  役割={f.roles}  cp=mate-only  win={f.winability:.2f} "
+                                f"(stab={f.stability:.2f} diff={f.opp_diff:.2f} risk={f.self_risk:.2f} init={f.initiative:.2f} div={f.divergence:.2f})"
+                            )
                         else:
                             delta = (_safe_best_cp(best.cp) - (0 if abs(c.cp) >= 20000 else c.cp))
-                            info(f"[{i+1}] {c.move}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f} "
-                                 f"(stab={f.stability:.2f} diff={f.opp_diff:.2f} risk={f.self_risk:.2f} init={f.initiative:.2f}) "
-                                 f"{f.label}")
+                            info(
+                                f"[{i+1}] {mv_disp}  役割={f.roles}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f} "
+                                f"(stab={f.stability:.2f} diff={f.opp_diff:.2f} risk={f.self_risk:.2f} init={f.initiative:.2f} div={f.divergence:.2f})"
+                            )
 
                 out(f"bestmove {chosen}")
                 continue

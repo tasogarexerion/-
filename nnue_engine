@@ -13,12 +13,14 @@ NNUE USI Proxy (YaneuraOu系想定)
     ANALYZE : 候補数増、Winability順提示
 
 [Patch (executed)]
-1) resign/win/0000 などの特殊bestmoveを safety_check 対象外にする（致命バグ回避）
-2) 候補の保持を depth 最大優先にする（浅いinfoで上書きされるフラつき対策）
-3) safety_check の stop→bestmove 同期を少しだけ堅くする（混線低減）
-4) safety_check 後の position 復元は「必要時のみ」実行（余計な重さを避ける）
+- safety_check_after_move の終了時に base_position を再送して局面を「必ず」復元（状態汚染防止）
+- safety_check の mate+ を “短手数は即unsafe / 長手数は複数回観測でunsafe” にして誤検出を減らす
+- safety_check 中だけ recv timeout を短くして重さを減らす（READ_TIMEOUTは変更しない）
 
-既存の思想・機能は削らず、より安全にした上書き版。
+[New Patch]
+- USI stdin を別スレッドで読む：go中でも stop/ponderhit/quit を即座に処理（USI的に必須）
+- 子エンジン起動の cwd をこのスクリプトのフォルダに固定（eval/book相対パスの安定化）
+- エンジンが実際に持つ option を usi 出力から収集し、存在するものだけ setoption（No such option排除）
 """
 
 import os
@@ -27,16 +29,32 @@ import subprocess
 import threading
 import queue
 import time
-import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
+
+# =========================
+# PATH / CWD 固定
+# =========================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _abspath_under_script(p: str) -> str:
+    if not p:
+        return p
+    if os.path.isabs(p):
+        return p
+    return os.path.join(SCRIPT_DIR, p)
 
 # =========================
 # CONFIG (環境変数で上書き可)
 # =========================
 ENGINE_PATH = os.environ.get("TASO_ENGINE", "./YaneuraOu")
-NNUE_PATH   = os.environ.get("TASO_NNUE", "nnue.bin")
-ENGINE_CMD = [ENGINE_PATH, "-eval", NNUE_PATH]
+NNUE_PATH   = os.environ.get("TASO_NNUE", "eval")  # ← 安全側のデフォルト：evalフォルダ
+
+ENGINE_PATH_ABS = _abspath_under_script(ENGINE_PATH)
+NNUE_PATH_ABS   = _abspath_under_script(NNUE_PATH)
+
+# エンジン起動引数（やねうら王系）
+ENGINE_CMD = [ENGINE_PATH_ABS, "-eval", NNUE_PATH_ABS]
 
 THREADS = int(os.environ.get("TASO_THREADS", "6"))
 HASH_MB = int(os.environ.get("TASO_HASH_MB", "4096"))
@@ -71,12 +89,14 @@ SAFETY_DEADLINE_FACTOR  = float(os.environ.get("TASO_SAFETY_DEADLINE_FACTOR", "3
 SAFETY_DEADLINE_PAD_SEC = float(os.environ.get("TASO_SAFETY_DEADLINE_PAD_SEC", "0.05"))
 SAFETY_STOP_GRACE_SEC   = float(os.environ.get("TASO_SAFETY_STOP_GRACE_SEC", "0.25"))
 
-# --- Patch knobs (new; safe defaults) ---
+# safety_check中だけ短いtimeout
 SAFETY_READ_TIMEOUT = float(os.environ.get("TASO_SAFETY_READ_TIMEOUT", "0.02"))
 SAFETY_MATE_MAX = int(os.environ.get("TASO_SAFETY_MATE_MAX", str(MATE_SHORT_MAX)))
 SAFETY_MATE_REPEAT = int(os.environ.get("TASO_SAFETY_MATE_REPEAT", "2"))
-# stop後の同期回収を伸ばしてもよい上限（混線が疑われる環境向け）
-SAFETY_STOP_HARD_CAP_SEC = float(os.environ.get("TASO_SAFETY_STOP_HARD_CAP_SEC", "0.60"))
+
+# book が無いなら自動でOFF（ノイズ削減・挙動は変えない）
+AUTO_DISABLE_BOOK = os.environ.get("TASO_AUTO_DISABLE_BOOK", "1") == "1"
+BOOK_FILE = os.path.join(SCRIPT_DIR, "book", "standard_book.db")
 
 MODE_PLAY = "PLAY"
 MODE_WATCH = "WATCH"
@@ -108,17 +128,54 @@ def dbg(s: str) -> None:
             pass
 
 # =========================
+# Stdin Reader (go中 stop/quit 即応)
+# =========================
+class StdinReader:
+    def __init__(self) -> None:
+        self.q: queue.Queue[str] = queue.Queue()
+        self.alive = True
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+
+    def _run(self) -> None:
+        try:
+            for raw in sys.stdin:
+                line = raw.strip()
+                if not line:
+                    continue
+                self.q.put(line)
+            self.alive = False
+        except Exception:
+            self.alive = False
+
+    def get(self, timeout: Optional[float] = None) -> Optional[str]:
+        try:
+            return self.q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def get_nowait(self) -> Optional[str]:
+        try:
+            return self.q.get_nowait()
+        except queue.Empty:
+            return None
+
+# =========================
 # Engine Wrapper
 # =========================
 class Engine:
     def __init__(self):
+        if not os.path.isfile(ENGINE_PATH_ABS):
+            raise FileNotFoundError(f"Engine not found: {ENGINE_PATH_ABS}")
+
         self.p = subprocess.Popen(
             ENGINE_CMD,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,  # 必要なら DEVNULL -> None にして見る
             text=True,
-            bufsize=1
+            bufsize=1,
+            cwd=SCRIPT_DIR,  # ★重要：eval/ book の相対パスを安定させる
         )
         self.q: queue.Queue[str] = queue.Queue()
         self.alive = True
@@ -146,7 +203,6 @@ class Engine:
             return None
 
     def drain(self, limit: int = 200000) -> int:
-        """queueの残骸を捨てる（誤読・混線防止）"""
         n = 0
         while n < limit:
             try:
@@ -192,20 +248,6 @@ def prefix_len(a: str, b: str, k: int = PREFIX_K) -> int:
         n += 1
     return n
 
-# USI指し手の簡易判定（安全確認に不正moveを投げないため）
-_RE_MOVE = re.compile(r"^[1-9][a-i][1-9][a-i]\+?$")            # 7g7f / 7g7f+
-_RE_DROP = re.compile(r"^[PLNSGBRK]\*[1-9][a-i]$")            # P*7f
-
-def is_special_bestmove(mv: str) -> bool:
-    mv = mv.strip().lower()
-    return mv in ("resign", "win", "0000", "(none)")
-
-def is_usi_move_token(mv: str) -> bool:
-    mv = mv.strip()
-    if not mv or is_special_bestmove(mv):
-        return False
-    return bool(_RE_MOVE.match(mv) or _RE_DROP.match(mv))
-
 @dataclass
 class Cand:
     mpv: int
@@ -213,7 +255,6 @@ class Cand:
     pv: str
     cp: int
     mate: Optional[int]
-    depth: int
 
 @dataclass
 class Features:
@@ -239,24 +280,21 @@ def mate_initiative(d: int) -> float:
     return clamp(MATE_INIT_FLOOR + (1.0 - MATE_INIT_FLOOR) * math.exp(-float(d) / MATE_INIT_TAU))
 
 def _safe_best_cp(best_cp: int) -> int:
-    # mateのみ等で±30000を入れても、相対計算の基準にすると壊れるのでガード
     return 0 if abs(best_cp) >= 20000 else best_cp
 
 def compute_features(
     cand: Cand,
     best: Cand,
-    context_cands: List[Cand],   # ※フィルタ前を渡す（mate負の気配も拾う）
+    context_cands: List[Cand],
     mode_hint: str
 ) -> Features:
     best_cp_used = _safe_best_cp(best.cp)
     cand_cp_used = 0 if abs(cand.cp) >= 20000 else cand.cp
-
     delta = best_cp_used - cand_cp_used
 
     pv_pref = prefix_len(best.pv, cand.pv, PREFIX_K)
     stability = clamp(pv_pref / float(max(1, PREFIX_K)))
 
-    # “良い手”の数（局面内相対）— mate巨大cpに引きずられないよう best_cp_used を使う
     good = 0
     for c in context_cands:
         ccp = 0 if abs(c.cp) >= 20000 else c.cp
@@ -265,7 +303,6 @@ def compute_features(
     good = max(1, good)
     opp_diff = clamp(1.0 / float(good))
 
-    # 自己危険度
     risk = 0.2
     if cand.mate is not None and cand.mate < 0:
         risk = 1.0
@@ -275,7 +312,6 @@ def compute_features(
         elif delta >= 180:
             risk = max(risk, 0.5)
 
-    # 局面全体での mate負気配（フィルタ前の context から拾う）
     mate_neg_best = None
     for c in context_cands:
         if c.mate is not None and c.mate < 0:
@@ -287,7 +323,6 @@ def compute_features(
 
     self_risk = clamp(risk)
 
-    # Initiative
     initiative = 0.0
     if cand.mate is not None and cand.mate > 0:
         initiative = max(initiative, mate_initiative(abs(cand.mate)))
@@ -380,40 +415,12 @@ def rank_candidates(
 # =========================
 # Safety check (post-move)
 # =========================
-def _sync_stop_and_wait_bestmove(eng: Engine, rto: float, grace: float) -> None:
-    """
-    stop を送った後に bestmove を短時間回収して同期する。
-    回収できなくても、その後 drain で混線を減らす。
-    """
-    eng.send("stop")
-    t_stop = time.time() + max(0.01, grace)
-    hard_cap = time.time() + max(0.05, SAFETY_STOP_HARD_CAP_SEC)
-    while time.time() < t_stop:
-        o = eng.recv(rto)
-        if o and o.startswith("bestmove"):
-            return
-    while time.time() < hard_cap:
-        o = eng.recv(rto)
-        if o and o.startswith("bestmove"):
-            return
-
 def safety_check_after_move(
     eng: Engine,
     base_position: str,
     move: str
 ) -> bool:
-    """
-    moveを指した後の局面（相手番）で短時間探索。
-    相手番なので、info mate +N は「相手が詰ます」= 自玉が詰む → unsafe。
-
-    Patch:
-    - 終了時に base_position を必要時のみ再送して局面を復元（状態汚染防止）
-    - mate+ の誤検出を減らす：短手数は即unsafe / 長手数は複数回観測でunsafe
-    - safety中だけ recv timeout を短くする
-    """
     if not base_position.startswith("position"):
-        return False
-    if not is_usi_move_token(move):
         return False
 
     eng.drain()
@@ -439,7 +446,6 @@ def safety_check_after_move(
 
     rto = min(READ_TIMEOUT, max(0.001, SAFETY_READ_TIMEOUT))
 
-    broke_early = False
     while time.time() < deadline:
         o = eng.recv(rto)
         if o is None:
@@ -463,89 +469,133 @@ def safety_check_after_move(
             break
 
         if unsafe:
-            broke_early = True
             break
 
-    if not got_bestmove or broke_early:
-        _sync_stop_and_wait_bestmove(eng, rto, SAFETY_STOP_GRACE_SEC)
+    if not got_bestmove:
+        eng.send("stop")
+        t_stop = time.time() + SAFETY_STOP_GRACE_SEC
+        while time.time() < t_stop:
+            o = eng.recv(rto)
+            if o is None:
+                continue
+            if o.startswith("bestmove"):
+                break
 
-    if (not got_bestmove) or broke_early:
-        eng.send(base_position)
-
+    eng.send(base_position)
     eng.drain()
     return unsafe
+
+# =========================
+# USI option collector
+# =========================
+def _parse_option_name(line: str) -> Optional[str]:
+    # example: "option name Threads type spin default 4 ..."
+    if not line.startswith("option "):
+        return None
+    tt = line.split()
+    if "name" not in tt:
+        return None
+    i = tt.index("name")
+    if i + 1 >= len(tt):
+        return None
+    return tt[i + 1]
 
 # =========================
 # Main USI loop
 # =========================
 def main() -> None:
     eng = Engine()
+    stdin = StdinReader()
 
     current_position = ""
     user_mode = DEFAULT_MODE
     multipv = DEFAULT_MULTIPV
 
+    supported_opts: Set[str] = set()
+
+    def send_opt(name: str, value: str) -> None:
+        if name in supported_opts:
+            eng.send(f"setoption name {name} value {value}")
+
     def apply_engine_opts():
-        eng.send(f"setoption name Threads value {THREADS}")
-        eng.send(f"setoption name Hash value {HASH_MB}")
-        eng.send(f"setoption name USI_Hash value {HASH_MB}")
-        eng.send(f"setoption name HashSize value {HASH_MB}")
-        eng.send(f"setoption name MultiPV value {multipv}")
+        # ここは存在する option だけ送る（No such option を根絶）
+        send_opt("Threads", str(THREADS))
+        send_opt("USI_Hash", str(HASH_MB))
+        send_opt("MultiPV", str(multipv))
+
+        # book が無いなら ownbook を落とす（ノイズ削減）
+        if AUTO_DISABLE_BOOK and not os.path.isfile(BOOK_FILE):
+            send_opt("USI_OwnBook", "false")
+
+    def handle_setoption(line: str) -> bool:
+        nonlocal user_mode, multipv
+        toks = line.split()
+        if "name" in toks:
+            i = toks.index("name")
+            name = toks[i + 1] if i + 1 < len(toks) else ""
+            value = ""
+            if "value" in toks:
+                j = toks.index("value")
+                value = " ".join(toks[j + 1 :]) if j + 1 < len(toks) else ""
+
+            if name == "TASO_Mode":
+                v = value.strip().upper()
+                if v in (MODE_PLAY, MODE_WATCH, MODE_ANALYZE):
+                    user_mode = v
+                    info(f"mode set => {user_mode}")
+                return True
+
+            if name == "TASO_MultiPV":
+                mv = _try_int(value.strip())
+                if mv is not None and 1 <= mv <= 10:
+                    multipv = mv
+                    info(f"multipv set => {multipv}")
+                    apply_engine_opts()
+                return True
+
+            if name == "TASO_SafetyMs":
+                info("TASO_SafetyMs is fixed via env TASO_SAFETY_MS (restart required)")
+                return True
+
+        return False
 
     try:
         while True:
-            raw = sys.stdin.readline()
-            if not raw:
-                break
-            line = raw.strip()
-            if not line:
+            line = stdin.get(timeout=0.1)
+            if line is None:
+                if not stdin.alive and stdin.q.empty():
+                    break
                 continue
 
+            # ---- USI handshake ----
             if line == "usi":
+                supported_opts.clear()
                 eng.send("usi")
                 while True:
                     o = eng.recv(READ_TIMEOUT)
                     if o is None:
                         continue
+
+                    # option収集
+                    if o.startswith("option "):
+                        name = _parse_option_name(o)
+                        if name:
+                            supported_opts.add(name)
+
                     if o == "usiok":
-                        out('option name TASO_Mode type combo default {} var PLAY var WATCH var ANALYZE'.format(DEFAULT_MODE))
-                        out('option name TASO_MultiPV type spin default {} min 1 max 10'.format(DEFAULT_MULTIPV))
-                        out('option name TASO_SafetyMs type spin default {} min 0 max 500'.format(SAFETY_MS))
+                        out(f'option name TASO_Mode type combo default {DEFAULT_MODE} var PLAY var WATCH var ANALYZE')
+                        out(f'option name TASO_MultiPV type spin default {DEFAULT_MULTIPV} min 1 max 10')
+                        out(f'option name TASO_SafetyMs type spin default {SAFETY_MS} min 0 max 500')
                         out("usiok")
                         break
                     out(o)
+
                 apply_engine_opts()
                 continue
 
             if line.startswith("setoption"):
-                toks = line.split()
-                if "name" in toks:
-                    i = toks.index("name")
-                    name = toks[i + 1] if i + 1 < len(toks) else ""
-                    value = ""
-                    if "value" in toks:
-                        j = toks.index("value")
-                        value = " ".join(toks[j + 1:]) if j + 1 < len(toks) else ""
-
-                    if name == "TASO_Mode":
-                        v = value.strip().upper()
-                        if v in (MODE_PLAY, MODE_WATCH, MODE_ANALYZE):
-                            user_mode = v
-                            info(f"mode set => {user_mode}")
-                        continue
-
-                    if name == "TASO_MultiPV":
-                        mv = _try_int(value.strip())
-                        if mv is not None and 1 <= mv <= 10:
-                            multipv = mv
-                            info(f"multipv set => {multipv}")
-                            apply_engine_opts()
-                        continue
-
-                    if name == "TASO_SafetyMs":
-                        info("TASO_SafetyMs is fixed via env TASO_SAFETY_MS (restart required)")
-                        continue
-
+                if handle_setoption(line):
+                    continue
                 eng.send(line)
                 continue
 
@@ -566,14 +616,18 @@ def main() -> None:
                         out(o)
                 continue
 
+            if line == "usinewgame":
+                eng.send(line)
+                continue
+
             if line.startswith("position"):
                 current_position = line
                 eng.send(line)
                 continue
 
+            # ---- GO ----
             if line.startswith("go"):
                 eng.drain()
-
                 apply_engine_opts()
                 eng.send(line)
 
@@ -583,8 +637,26 @@ def main() -> None:
                 t_go = time.time()
                 sent_stop = False
                 already_resigned = False
+                deferred: List[str] = []  # go中に来た stop/quit 以外は後で処理（原則来ないが保険）
 
-                for _ in range(LINE_LIMIT):
+                while True:
+                    # 1) go中に stdin をポーリング（stop/ponderhit/quit 即応）
+                    while True:
+                        cmd = stdin.get_nowait()
+                        if cmd is None:
+                            break
+                        if cmd == "stop":
+                            eng.send("stop")
+                            sent_stop = True
+                        elif cmd == "ponderhit":
+                            eng.send("ponderhit")
+                        elif cmd == "quit":
+                            eng.send("quit")
+                            return
+                        else:
+                            deferred.append(cmd)
+
+                    # 2) ハードタイムアウト
                     if time.time() - t_go > GO_HARD_SEC:
                         if not sent_stop:
                             eng.send("stop")
@@ -602,14 +674,8 @@ def main() -> None:
 
                     if o.startswith("info"):
                         out(o)
+
                         tt = o.split()
-
-                        depth = 0
-                        if "depth" in tt:
-                            d = _try_int(tt[tt.index("depth") + 1] if tt.index("depth") + 1 < len(tt) else "")
-                            if d is not None:
-                                depth = d
-
                         mpv = 1
                         if "multipv" in tt:
                             m = _try_int(tt[tt.index("multipv") + 1] if tt.index("multipv") + 1 < len(tt) else "")
@@ -627,7 +693,7 @@ def main() -> None:
                         if "pv" in tt:
                             i_pv = tt.index("pv")
                             if i_pv + 1 < len(tt):
-                                pv = " ".join(tt[i_pv + 1:])
+                                pv = " ".join(tt[i_pv + 1 :])
                                 mv = tt[i_pv + 1]
 
                                 if cp is None:
@@ -636,9 +702,7 @@ def main() -> None:
                                     else:
                                         cp = 0
 
-                                prev = cands_map.get(mpv)
-                                if prev is None or depth >= prev.depth:
-                                    cands_map[mpv] = Cand(mpv=mpv, move=mv, pv=pv, cp=cp, mate=mate, depth=depth)
+                                cands_map[mpv] = Cand(mpv=mpv, move=mv, pv=pv, cp=cp, mate=mate)
                         continue
 
                     if o.startswith("bestmove"):
@@ -647,6 +711,21 @@ def main() -> None:
                         break
 
                     out(o)
+
+                # goが終わった後、deferredを先頭に戻したいが、USI的には通常来ないので処理だけする
+                for cmd in deferred:
+                    if cmd.startswith("setoption"):
+                        if not handle_setoption(cmd):
+                            eng.send(cmd)
+                    elif cmd.startswith("position"):
+                        current_position = cmd
+                        eng.send(cmd)
+                    elif cmd == "usinewgame":
+                        eng.send(cmd)
+                    elif cmd == "quit":
+                        eng.send("quit")
+                        return
+                    # それ以外は無視
 
                 if already_resigned:
                     continue
@@ -689,15 +768,13 @@ def main() -> None:
                         chosen = max(safe_cands, key=lambda x: x.cp).move
                         break
 
-                if SAFETY_MS > 0 and current_position and is_usi_move_token(chosen):
+                if SAFETY_MS > 0 and current_position:
                     unsafe = safety_check_after_move(eng, current_position, chosen)
                     if unsafe:
                         info(f"☠ safety-check failed for {chosen} -> fallback")
                         alt = None
                         for c in ranked[: min(5, len(ranked))]:
                             if c.move == chosen:
-                                continue
-                            if not is_usi_move_token(c.move):
                                 continue
                             if safety_check_after_move(eng, current_position, c.move):
                                 continue
@@ -708,6 +785,7 @@ def main() -> None:
                         else:
                             info("☠ no alternative passed safety-check (keep chosen)")
 
+                # 表示
                 if user_mode == MODE_PLAY:
                     f_best = feats_by_move.get(best.move)
                     if f_best:
@@ -726,12 +804,11 @@ def main() -> None:
                     for i in range(show_n):
                         c = ranked[i]
                         f = feats_by_move[c.move]
-                        cp_disp = c.cp
-                        if abs(cp_disp) >= 20000:
+                        if abs(c.cp) >= 20000:
                             info(f"候補{i+1}: {c.move}  cp=mate-only  win={f.winability:.2f}  {f.label}")
                         else:
                             delta = (_safe_best_cp(best.cp) - (0 if abs(c.cp) >= 20000 else c.cp))
-                            info(f"候補{i+1}: {c.move}  cp={cp_disp:+d} Δ={delta:+d}  win={f.winability:.2f}  {f.label}")
+                            info(f"候補{i+1}: {c.move}  cp={c.cp:+d} Δ={delta:+d}  win={f.winability:.2f}  {f.label}")
 
                 else:  # ANALYZE
                     f_best = feats_by_move.get(best.move)

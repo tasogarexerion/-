@@ -1228,6 +1228,245 @@ class StanceState:
 
         return self.state
 
+
+# =========================
+# IntentState (plan) lifecycle
+# - current_plan を「筋」として保持し、例外条件のみで切替を正当化
+# - plan は bestmove を歪めない（候補の並び/説明のみに影響）
+# =========================
+
+# plan（意図）の種類（固定）
+PL_SHAPE    = "SHAPE"     # 形づくり/整備
+PL_MAINLINE = "MAINLINE"  # 本線継続
+PL_PRESSURE = "PRESSURE"  # プレッシャー（圧）
+PL_SHAKE    = "SHAKE"     # 揺さぶり
+PL_SURVIVE  = "SURVIVE"   # 粘り（チャンス待ち）
+PL_GAMBLE   = "GAMBLE"    # 勝負手（下駄を預ける）
+PL_CONVERT  = "CONVERT"   # 勝勢運用（収束）
+PL_FINISH   = "FINISH"    # 寄せ切り
+
+PLAN_NAMES_JP = {
+    PL_SHAPE:    "形づくり",
+    PL_MAINLINE: "本線継続",
+    PL_PRESSURE: "プレッシャー",
+    PL_SHAKE:    "揺さぶり",
+    PL_SURVIVE:  "粘り（チャンス待ち）",
+    PL_GAMBLE:   "勝負手（下駄）",
+    PL_CONVERT:  "勝勢運用",
+    PL_FINISH:   "寄せ切り",
+}
+
+# ユーザー棋風（候補の並び替えの傾向にだけ反映）
+STYLE_BALANCE = "BALANCE"
+STYLE_ATTACK  = "ATTACK"
+STYLE_DEFENSE = "DEFENSE"
+USER_STYLE = os.environ.get("TASO_STYLE", STYLE_BALANCE).upper()
+if USER_STYLE not in (STYLE_BALANCE, STYLE_ATTACK, STYLE_DEFENSE):
+    USER_STYLE = STYLE_BALANCE
+
+# planの粘着（局面が同じ go では基本維持）
+PLAN_LOCK_PLIES = int(os.environ.get("TASO_PLAN_LOCK_PLIES", "2"))  # 何手ぶんは切替を抑制
+PLAN_CP_JUMP_OK = float(os.environ.get("TASO_PLAN_CP_JUMP_OK", "260"))  # self_cp(EWMA fast)のジャンプで切替OK
+PLAN_PVCS_JUMP_OK = float(os.environ.get("TASO_PLAN_PVCS_JUMP_OK", "0.22"))  # PVContactSoon(EWMA)の増加で切替OK
+
+def _phase_index(p: str) -> int:
+    order = [GP_BUILD, GP_PROBE, GP_TENSION, GP_CLASH, GP_CONVERT, GP_FINISH]
+    try:
+        return order.index(p)
+    except Exception:
+        return 0
+
+def _pos_signature(position_line: str) -> str:
+    """同一局面判定用。moves の末尾だけを見る（軽量・安定）。"""
+    if not position_line:
+        return ""
+    tt = position_line.split()
+    if "moves" not in tt:
+        return position_line
+    i = tt.index("moves")
+    tail = tt[max(0, len(tt) - 20):]  # 末尾20手ぶん
+    head = tt[: i + 1]
+    return " ".join(head + tail)
+
+def _roles_contains(f: 'Features', key: str) -> bool:
+    return key in (f.roles or "")
+
+def _suggest_plan(
+    gp_phase: str,
+    stance: str,
+    best_feat: 'Features',
+) -> str:
+    # まずフェイズ主導の強制
+    if gp_phase == GP_FINISH:
+        return PL_FINISH
+    if gp_phase == GP_CONVERT and stance == ST_AHEAD:
+        return PL_CONVERT
+
+    # ロール主導（bestPVの役割から推測）
+    r = best_feat.roles or ""
+
+    if "鬼手" in r:
+        return PL_FINISH if gp_phase in (GP_CLASH, GP_CONVERT, GP_FINISH) else PL_GAMBLE
+    if "勝負手" in r or "下駄を預ける" in r:
+        return PL_GAMBLE
+    if "チャンス待ち" in r or "粘り" in r:
+        return PL_SURVIVE
+    if "揺さぶり" in r:
+        return PL_SHAKE
+    if "圧" in r:
+        return PL_PRESSURE
+    if "手堅い" in r or "受け切り" in r:
+        return PL_CONVERT if stance == ST_AHEAD else PL_SURVIVE
+    # default
+    if gp_phase in (GP_BUILD, GP_PROBE):
+        return PL_SHAPE
+    if gp_phase == GP_TENSION:
+        return PL_MAINLINE
+    return PL_MAINLINE
+
+def _style_bias(plan: str) -> str:
+    # 棋風でほんの少しだけ寄せる（切替の最終段の微調整）
+    if USER_STYLE == STYLE_ATTACK:
+        if plan in (PL_SHAPE, PL_CONVERT) :
+            return PL_MAINLINE
+    if USER_STYLE == STYLE_DEFENSE:
+        if plan in (PL_PRESSURE, PL_SHAKE, PL_GAMBLE):
+            return PL_SURVIVE
+    return plan
+
+def _plan_affinity(plan: str, gp_phase: str, stance: str, f: 'Features') -> float:
+    """候補の並び替え用：planに合う役割へ僅かなボーナス。"""
+    r = f.roles or ""
+    s = 0.0
+
+    # 基本：役割 ↔ plan
+    if plan == PL_SHAPE and ("手堅い" in r or "本線" in r):
+        s += 0.10
+    if plan == PL_MAINLINE and ("本線" in r):
+        s += 0.12
+    if plan == PL_PRESSURE and ("圧" in r):
+        s += 0.14
+    if plan == PL_SHAKE and ("揺さぶり" in r):
+        s += 0.14
+    if plan == PL_SURVIVE and ("粘り" in r or "チャンス待ち" in r):
+        s += 0.14
+    if plan == PL_GAMBLE and ("勝負手" in r or "下駄を預ける" in r or "鬼手" in r):
+        s += 0.14
+    if plan == PL_CONVERT and ("手堅い" in r or "受け切り" in r):
+        s += 0.14
+    if plan == PL_FINISH and ("鬼手" in r):
+        s += 0.14
+
+    # フェイズとの相性（軽く）
+    if gp_phase == GP_TENSION and plan in (PL_PRESSURE, PL_MAINLINE):
+        s += 0.05
+    if gp_phase == GP_CLASH and plan in (PL_PRESSURE, PL_SHAKE, PL_MAINLINE):
+        s += 0.05
+    if gp_phase == GP_CONVERT and plan == PL_CONVERT:
+        s += 0.06
+    if gp_phase == GP_FINISH and plan == PL_FINISH:
+        s += 0.08
+
+    # スタンス補正（軽く）
+    if stance == ST_BEHIND and plan in (PL_SURVIVE, PL_GAMBLE, PL_SHAKE):
+        s += 0.04
+    if stance == ST_AHEAD and plan in (PL_CONVERT, PL_SHAPE):
+        s += 0.04
+
+    return s
+
+class IntentState:
+    def __init__(self) -> None:
+        self.current_plan: str = PL_MAINLINE
+        self.lock_left: int = 0
+        self.last_pos_sig: str = ""
+        self.last_cp_fast: Optional[float] = None
+        self.last_pvcs: Optional[float] = None
+        self.last_phase: Optional[str] = None
+
+    def reset(self) -> None:
+        self.current_plan = PL_MAINLINE
+        self.lock_left = 0
+        self.last_pos_sig = ""
+        self.last_cp_fast = None
+        self.last_pvcs = None
+        self.last_phase = None
+
+    def update(
+        self,
+        *,
+        position_line: str,
+        gp_phase: str,
+        stance: str,
+        cp_fast: float,
+        pvcs_ew: float,
+        shock: bool,
+        best_feat: 'Features',
+    ) -> Tuple[str, str]:
+        """
+        Returns (intent_line, reason)
+        - intent_line: 表示用（継続/切替理由つき）
+        - reason: 切替理由（継続なら空）
+        """
+        pos_sig = _pos_signature(position_line)
+        pos_changed = (pos_sig != self.last_pos_sig)
+
+        # 初期化（最初の局面）
+        if not self.last_pos_sig:
+            self.last_pos_sig = pos_sig
+            self.last_cp_fast = cp_fast
+            self.last_pvcs = pvcs_ew
+            self.last_phase = gp_phase
+            sug = _style_bias(_suggest_plan(gp_phase, stance, best_feat))
+            self.current_plan = sug
+            self.lock_left = max(0, PLAN_LOCK_PLIES)
+            return (f"意図={PLAN_NAMES_JP.get(self.current_plan, self.current_plan)}（開始）", "開始")
+
+        # lockの減衰は「局面が進んだ時だけ」
+        if pos_changed and self.lock_left > 0:
+            self.lock_left -= 1
+
+        # 例外条件（切替の正当化）
+        reason = ""
+        if shock:
+            reason = "ショック遷移"
+        elif self.last_cp_fast is not None and abs(cp_fast - self.last_cp_fast) >= PLAN_CP_JUMP_OK:
+            reason = "評価急変"
+        elif self.last_pvcs is not None and (pvcs_ew - self.last_pvcs) >= PLAN_PVCS_JUMP_OK:
+            reason = "戦場が開いた"
+        else:
+            # フェイズが2段以上進む（小ショック）
+            if self.last_phase is not None and (_phase_index(gp_phase) - _phase_index(self.last_phase)) >= 2:
+                reason = "急展開"
+
+        # 提案plan
+        sug = _style_bias(_suggest_plan(gp_phase, stance, best_feat))
+
+        switched = False
+        if sug != self.current_plan:
+            # 原則：lock中は維持。ただし例外理由があれば切替OK
+            if reason and (pos_changed or shock):
+                self.current_plan = sug
+                self.lock_left = max(0, PLAN_LOCK_PLIES)
+                switched = True
+            # lockが切れていて局面が進んだなら自然切替
+            elif pos_changed and self.lock_left <= 0 and gp_phase != GP_BUILD:
+                self.current_plan = sug
+                self.lock_left = max(0, PLAN_LOCK_PLIES)
+                reason = "自然切替"
+                switched = True
+
+        # 状態更新
+        if pos_changed:
+            self.last_pos_sig = pos_sig
+        self.last_cp_fast = cp_fast
+        self.last_pvcs = pvcs_ew
+        self.last_phase = gp_phase
+
+        if switched:
+            return (f"意図={PLAN_NAMES_JP.get(self.current_plan, self.current_plan)}（切替:{reason}）", reason)
+        return (f"意図={PLAN_NAMES_JP.get(self.current_plan, self.current_plan)}（継続）", "")
+
 def stance_vocab_for_display(gp_phase: str, stance: str) -> str:
     """phase × stance で、ユーザーに刺さる短い語彙を返す。"""
     if stance == ST_AHEAD:
@@ -1510,6 +1749,7 @@ def main() -> None:
     win_hys = WinPhaseHysteresis()
     game_state = GamePhaseState()
     stance_state = StanceState()
+    intent_state = IntentState()
 
     def send_opt(name: str, value: str) -> None:
         if name in supported_opts:
@@ -1612,6 +1852,9 @@ def main() -> None:
 
             if line == "usinewgame":
                 eng.send(line)
+                game_state.reset()
+                stance_state.reset()
+                intent_state.reset()
                 continue
 
             if line.startswith("position"):
@@ -1770,7 +2013,7 @@ def main() -> None:
                     if unsafe:
                         info(f"☠ safety-check failed for {chosen} -> fallback")
                         alt = None
-                        for c in ranked[: min(5, len(ranked))]:
+                        for c in ranked[: min(5, len(ranked_disp))]:
                             if c.move == chosen:
                                 continue
                             if safety_check_after_move(eng, current_position, c.move):
@@ -1812,11 +2055,12 @@ def main() -> None:
 
                 f_best = feats_by_move.get(best.move)
                 if user_mode in (MODE_PLAY, MODE_WATCH, MODE_ANALYZE) and f_best:
-                    info(
-                        f"[TASO] game={game_phase_text(gp_phase)}({gp_phase}) | 立場={st_vocab} | {game_phase_plan_text(gp_phase)} | {win_text}  "
+                    summary = (
+                        f"[TASO] game={game_phase_text(gp_phase)} / 立場={st_vocab} | {game_phase_plan_text(gp_phase)} | {win_text} | {intent_line}  "
                         f"win={disp_win(f_best.winability):.2f} (cp={_safe_best_cp(best.cp):+d}) "
                         f"(eng={game_state.ew_eng:.2f} csc={int(round(game_state.ew_csc))} ar={game_state.ew_ar:.2f} pv={game_state.ew_pvcs:.2f})"
                     )
+                    info(summary)
 
                 if short_mate and short_mate[0] <= MATE_SHORT_MAX:
                     info(f"⚡ short-mate seen: mate {short_mate[0]} (pv move {fmt_move(short_mate[1])})")
@@ -1825,9 +2069,9 @@ def main() -> None:
                     pass
 
                 elif user_mode == MODE_WATCH:
-                    show_n = min(3, len(ranked))
+                    show_n = min(3, len(ranked_disp))
                     for i in range(show_n):
-                        c = ranked[i]
+                        c = ranked_disp[i]
                         f = feats_by_move[c.move]
                         mv_disp = fmt_move(c.move)
                         roles = stylize_roles_by_gphase(f.roles, gp_phase)
@@ -1839,9 +2083,9 @@ def main() -> None:
                             info(f"候補{i+1}: {mv_disp}  役割={roles}  cp={c.cp:+d} Δ={delta:+d}  win={disp_win(f.winability):.2f}")
 
                 else:  # ANALYZE
-                    show_n = min(max(5, multipv), len(ranked))
+                    show_n = min(max(5, multipv), len(ranked_disp))
                     for i in range(show_n):
-                        c = ranked[i]
+                        c = ranked_disp[i]
                         f = feats_by_move[c.move]
                         mv_disp = fmt_move(c.move)
 
@@ -1870,3 +2114,27 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# --- IntentState（意図）を更新：筋の継続 / 切替の正当化 ---
+best_feat = feats_by_move.get(best.move)
+intent_line = ""
+if best_feat is not None:
+    intent_line, _intent_reason = intent_state.update(
+        position_line=current_position,
+        gp_phase=gp_phase,
+        stance=stance,
+        cp_fast=float(getattr(stance_state, "fast", 0.0)),
+        pvcs_ew=float(getattr(game_state, "ew_pvcs", 0.0)),
+        shock=bool(getattr(game_state, "shock", False)),
+        best_feat=best_feat,
+    )
+
+# 表示用の候補並び（planに合う役割を少しだけ前へ。元の強さ順は崩しにくい）
+if intent_line:
+    ranked_disp = sorted(
+        ranked,
+        key=lambda c: _plan_affinity(intent_state.current_plan, gp_phase, stance, feats_by_move[c.move]),
+        reverse=True,
+    )
+else:
+    ranked_disp = ranked

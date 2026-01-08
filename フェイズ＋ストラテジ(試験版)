@@ -146,6 +146,26 @@ GP_FINISH_CP_EXIT   = int(os.environ.get("TASO_GP_FINISH_CP_EXIT",   "1800"))
 GP_SHOCK_PVCS  = float(os.environ.get("TASO_GP_SHOCK_PVCS", "0.85"))
 GP_SHOCK_CSC   = int(os.environ.get("TASO_GP_SHOCK_CSC", "6"))
 
+# ---------------------------------------------------------
+# Phase polarity (stance) — フェイズに「有利/互角/不利」の視点を掛け算する
+#
+# 目的：
+# - 不利局面を "フェイズ追加" ではなく「立場」として表現（破綻しにくい）
+# - 絶対評価に寄りすぎない：短期EWMAと長期EWMAの差（流れ）も使う
+#
+# self_cp は「手番側（いま指す側）視点」の cp を想定（USIの通常動作）
+# ---------------------------------------------------------
+ST_EWMA_FAST_ALPHA = float(os.environ.get("TASO_ST_EWMA_FAST_ALPHA", "0.35"))
+ST_EWMA_SLOW_ALPHA = float(os.environ.get("TASO_ST_EWMA_SLOW_ALPHA", "0.08"))
+
+# 立場判定の主役は「流れ」(fast - slow)。絶対値は補助として弱めに使う。
+ST_REL_ENTER = int(os.environ.get("TASO_ST_REL_ENTER", "180"))
+ST_REL_EXIT  = int(os.environ.get("TASO_ST_REL_EXIT",  "90"))
+
+ST_ABS_ENTER = int(os.environ.get("TASO_ST_ABS_ENTER", "450"))
+ST_ABS_EXIT  = int(os.environ.get("TASO_ST_ABS_EXIT",  "250"))
+
+
 # PVContactSoon の先読み手数（ply）
 GP_PV_PLY = int(os.environ.get("TASO_GP_PV_PLY", "6"))
 
@@ -1157,6 +1177,71 @@ class GamePhaseState:
         self.phase = next_phase
         return self.phase
 
+
+# ---------------------------------------------------------
+# Polarity / Stance (Advantage, Even, Disadvantage)
+# ---------------------------------------------------------
+ST_AHEAD  = "AHEAD"
+ST_EVEN   = "EVEN"
+ST_BEHIND = "BEHIND"
+
+class StanceState:
+    """局面の「立場」を、短期/長期EWMAで滑らかに追う。
+
+    - fast: 直近の評価（いまの気配）
+    - slow: ちょい長めの平均（将棋の基調）
+    - rel = fast - slow: 「流れ」（戦型の癖を相殺しやすい）
+    """
+    def __init__(self) -> None:
+        self.fast: Optional[float] = None
+        self.slow: Optional[float] = None
+        self.state: str = ST_EVEN
+
+    def update(self, self_cp: int) -> str:
+        x = float(self_cp)
+
+        if self.fast is None:
+            self.fast = x
+            self.slow = x
+            self.state = ST_EVEN
+            return self.state
+
+        assert self.slow is not None
+        self.fast = (1.0 - ST_EWMA_FAST_ALPHA) * self.fast + ST_EWMA_FAST_ALPHA * x
+        self.slow = (1.0 - ST_EWMA_SLOW_ALPHA) * self.slow + ST_EWMA_SLOW_ALPHA * x
+
+        rel = self.fast - self.slow
+
+        if self.state == ST_AHEAD:
+            if rel < ST_REL_EXIT and self.fast < ST_ABS_EXIT:
+                self.state = ST_EVEN
+
+        elif self.state == ST_BEHIND:
+            if rel > -ST_REL_EXIT and self.fast > -ST_ABS_EXIT:
+                self.state = ST_EVEN
+
+        else:  # EVEN
+            if rel >= ST_REL_ENTER or self.fast >= ST_ABS_ENTER:
+                self.state = ST_AHEAD
+            elif rel <= -ST_REL_ENTER or self.fast <= -ST_ABS_ENTER:
+                self.state = ST_BEHIND
+
+        return self.state
+
+def stance_vocab_for_display(gp_phase: str, stance: str) -> str:
+    """phase × stance で、ユーザーに刺さる短い語彙を返す。"""
+    if stance == ST_AHEAD:
+        if gp_phase in ("CONVERT", "FINISH"):
+            return "勝ち筋運用"
+        return "押せる"
+    if stance == ST_BEHIND:
+        if gp_phase in ("CONVERT", "FINISH"):
+            return "凌ぎ勝負"
+        if gp_phase == "CLASH":
+            return "苦しい（粘り）"
+        return "我慢"
+    return "互角"
+
 def game_phase_text(phase: str) -> str:
     # 表示名は人間向け（短く）
     if phase == "BUILD":
@@ -1424,6 +1509,7 @@ def main() -> None:
     supported_opts: Set[str] = set()
     win_hys = WinPhaseHysteresis()
     game_state = GamePhaseState()
+    stance_state = StanceState()
 
     def send_opt(name: str, value: str) -> None:
         if name in supported_opts:
@@ -1711,6 +1797,10 @@ def main() -> None:
                     best_cp_abs = abs(_safe_best_cp(best.cp))
                     gp_phase = game_state.update(gp_raw, best_cp_abs, has_mate)
 
+                # ===== 立場（有利/互角/不利）を更新 =====
+                st = stance_state.update(_safe_best_cp(best.cp))
+                st_vocab = stance_vocab_for_display(gp_phase, st)
+
                 # ===== 表示（候補提示） =====
                 def fmt_move(mv: str) -> str:
                     if not current_position:
@@ -1723,7 +1813,8 @@ def main() -> None:
                 f_best = feats_by_move.get(best.move)
                 if user_mode in (MODE_PLAY, MODE_WATCH, MODE_ANALYZE) and f_best:
                     info(
-                        f"[TASO] game={game_phase_text(gp_phase)}({gp_phase}) {game_phase_plan_text(gp_phase)} / {win_text}  win={f_best.winability:.2f} "
+                        f"[TASO] game={game_phase_text(gp_phase)}({gp_phase}) | 立場={st_vocab} | {game_phase_plan_text(gp_phase)} | {win_text}  "
+                        f"win={disp_win(f_best.winability):.2f} (cp={_safe_best_cp(best.cp):+d}) "
                         f"(eng={game_state.ew_eng:.2f} csc={int(round(game_state.ew_csc))} ar={game_state.ew_ar:.2f} pv={game_state.ew_pvcs:.2f})"
                     )
 

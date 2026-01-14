@@ -9,14 +9,14 @@ TASO NNUE USI Proxy (YaneuraOu系想定)
 - 表示はシンプルに:
     - 現在の局面の段階（game phase）
     - 現在の局面の形勢（stance）
-    - intent（本筋/ATK/DEF の“線”をどれで繋ぐか）
-    - 候補手: 本筋 / ATK / DEF を軸に最大N手（WATCH）
+    - intent（内部: MAIN/ATK/DEF / 表示: 本筋・BULL・HEDGE）を“線”として維持
+    - 候補手: 本筋 / BULL / HEDGE を軸に最大N手（WATCH）
 - 内部では多数の指標を使って選ぶが、ユーザーに出す言葉は少なくする。
 
 重点:
-- (1) 候補ごとに PVContactSoon を計算して ATK を“気持ちよく”
-- (2) DEF トラック（前回DEF候補のPV）を保持し、慣性(inertia)で“腰を重く”
-- (3) CRISIS では DEF を厳格に（低リスク/低分岐を強優先）
+- (1) 候補ごとに PVContactSoon を計算して BULL（=ATK）を“気持ちよく”
+- (2) HEDGE（=DEF）トラック（前回HEDGE候補のPV）を保持し、慣性(inertia)で“腰を重く”
+- (3) CRISIS では HEDGE（=DEF）を厳格に（低リスク/低分岐を強優先）
 - intentsane: intent は「候補タグの“存在”」に従属（存在しないタグへ遷移しない）
 
 地雷潰し / 賢さ復元パッチ:
